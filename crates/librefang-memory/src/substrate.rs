@@ -1093,6 +1093,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_task_claim_name_mismatch() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        substrate
+            .task_post(
+                "Parse invoice",
+                "Extract totals from /inbox/invoice-42.pdf",
+                Some("invoice-parser"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A different agent (by name and UUID) should NOT claim it.
+        let claimed = substrate
+            .task_claim(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                Some("email-classifier"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_none(),
+            "task assigned to a different name must not be claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_claim_ambiguous_names() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let t1 = substrate
+            .task_post("Task A", "first", Some("worker"), None)
+            .await
+            .unwrap();
+        let t2 = substrate
+            .task_post("Task B", "second", Some("worker"), None)
+            .await
+            .unwrap();
+
+        // Two agents share the display name "worker" (e.g., across a Hand
+        // reactivation). Each should be able to claim one task; post-claim
+        // ownership is canonicalised to the claimant UUID so neither claim
+        // interferes with the other.
+        let uuid_a = "aaaaaaaa-1111-1111-1111-111111111111";
+        let uuid_b = "bbbbbbbb-2222-2222-2222-222222222222";
+
+        let claim_a = substrate
+            .task_claim(uuid_a, Some("worker"))
+            .await
+            .unwrap()
+            .expect("first worker should claim a task");
+        let claim_b = substrate
+            .task_claim(uuid_b, Some("worker"))
+            .await
+            .unwrap()
+            .expect("second worker should claim the remaining task");
+
+        // Each claimant got a different task.
+        assert_ne!(claim_a["id"], claim_b["id"]);
+        // Ownership canonicalised: assigned_to equals the claimant's UUID.
+        assert_eq!(claim_a["assigned_to"], uuid_a);
+        assert_eq!(claim_b["assigned_to"], uuid_b);
+        // Sanity: both task_ids are among the two we posted.
+        let a_id = claim_a["id"].as_str().unwrap();
+        let b_id = claim_b["id"].as_str().unwrap();
+        assert!(a_id == t1 || a_id == t2);
+        assert!(b_id == t1 || b_id == t2);
+
+        // Queue is now drained for that name.
+        let next = substrate
+            .task_claim("cccccccc-3333-3333-3333-333333333333", Some("worker"))
+            .await
+            .unwrap();
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
     async fn test_chunking_short_text_passthrough() {
         let config = ChunkConfig {
             enabled: true,
