@@ -10667,8 +10667,19 @@ impl KernelHandle for LibreFangKernel {
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+        // Resolve the caller's registered display name from the in-memory
+        // agent registry so substrate can match rows whose `assigned_to` was
+        // set to the agent's name (the natural multi-consumer routing pattern).
+        // An unparseable `agent_id` or a missing registry entry degrades
+        // safely to the existing UUID-or-broadcast-only behaviour.
+        let agent_name = agent_id
+            .parse::<AgentId>()
+            .ok()
+            .and_then(|id| self.registry.get(id))
+            .map(|entry| entry.name);
+
         self.memory
-            .task_claim(agent_id)
+            .task_claim(agent_id, agent_name.as_deref())
             .await
             .map_err(|e| format!("Task claim failed: {e}"))
     }
