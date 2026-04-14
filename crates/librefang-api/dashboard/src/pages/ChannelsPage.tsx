@@ -412,9 +412,9 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
                         addToast(ok ? t("common.copied") : t("common.copy_failed"), ok ? "success" : "error");
                       }}
                       className="px-3 py-2 rounded-lg bg-brand/10 text-brand text-xs hover:bg-brand/20 transition-colors shrink-0"
-                      title="Copy"
+                      title={t("common.copy")}
                     >
-                      Copy
+                      {t("common.copy")}
                     </button>
                   </div>
                 ) : field.type === "select" && field.options ? (
@@ -485,7 +485,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
       const res = await qrStart();
       if (!res.available || !res.qr_code) {
         setPhase("error");
-        setMessage(res.message || "Failed to get QR code");
+        setMessage(res.message || t("channels.qr_failed"));
         return;
       }
       setPhase("scanning");
@@ -508,7 +508,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
             if (status.connected && status.bot_token) {
               cancelledRef.current = true;
               setPhase("success");
-              setMessage("Login successful! Saving configuration...");
+              setMessage(t("channels.login_success"));
               await configureChannel(channel.name, { bot_token_env: status.bot_token });
               queryClient.invalidateQueries({ queryKey: ["channels", "list"] });
               setTimeout(onClose, 1500);
@@ -796,7 +796,7 @@ export function ChannelsPage() {
       </div>
 
       {channelsQuery.isLoading ? (
-        <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3" : "flex flex-col gap-2"}>
+        <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
           {[1, 2, 3].map((i) => <CardSkeleton key={i} />)}
         </div>
       ) : channels.length === 0 ? (
@@ -819,7 +819,7 @@ export function ChannelsPage() {
             )}
           </div>
 
-          <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3" : "flex flex-col gap-2"}>
+          <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
             {paginatedChannels.map((c) => (
               <ChannelCard
                 key={c.name}

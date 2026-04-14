@@ -262,6 +262,57 @@ async fn dashboard_login(
                 );
             }
 
+            // TOTP second-factor check for login
+            let policy = state.kernel.approvals().policy();
+            if policy.second_factor.requires_login_totp() {
+                let totp_enrolled = state
+                    .kernel
+                    .vault_get("totp_secret")
+                    .is_some_and(|s| !s.is_empty());
+                let totp_confirmed =
+                    state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
+                if totp_enrolled && totp_confirmed {
+                    let totp_code = body.get("totp_code").and_then(|v| v.as_str()).unwrap_or("");
+                    if totp_code.is_empty() {
+                        // Password OK but TOTP required — ask frontend to prompt
+                        return axum::response::Json(serde_json::json!({
+                            "ok": false,
+                            "requires_totp": true,
+                        }))
+                        .into_response();
+                    }
+                    // Verify TOTP code
+                    let secret = state.kernel.vault_get("totp_secret").unwrap_or_default();
+                    let issuer = policy.totp_issuer.clone();
+                    match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                        &secret, totp_code, &issuer,
+                    ) {
+                        Ok(true) => { /* TOTP valid, proceed to session creation */ }
+                        Ok(false) => {
+                            return (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::response::Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "Invalid TOTP code",
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Err(e) => {
+                            tracing::warn!("TOTP verification error during login: {e}");
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::response::Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "TOTP verification failed",
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+
             // Store the session token so the auth middleware can validate it.
             {
                 let mut sessions = state.active_sessions.write().await;
@@ -650,6 +701,7 @@ pub async fn build_router(
             kernel.config_ref().provider_urls.clone(),
         ),
         webhook_router,
+        config_write_lock: tokio::sync::Mutex::new(()),
         #[cfg(feature = "telemetry")]
         prometheus_handle: prom_handle,
     });
@@ -691,18 +743,39 @@ pub async fn build_router(
     // AuthState shares api_key_lock with AppState so change_password can update it live.
     let user_api_keys_vec = configured_user_api_keys(state.kernel.as_ref());
     let dashboard_auth_enabled = has_dashboard_credentials(state.kernel.as_ref());
-    let require_auth_for_reads = state.kernel.config_ref().require_auth_for_reads;
-    if require_auth_for_reads {
-        let api_key_set = !state.kernel.config_ref().api_key.trim().is_empty();
-        let any_auth = api_key_set || !user_api_keys_vec.is_empty() || dashboard_auth_enabled;
-        if !any_auth {
-            tracing::warn!(
-                "require_auth_for_reads = true but no authentication is configured \
-                 (api_key, user_api_keys, and dashboard credentials are all empty). \
-                 The flag will have no effect — set an api_key or configure dashboard \
-                 credentials to lock down read endpoints."
-            );
-        }
+    let api_key_set = !state.kernel.config_ref().api_key.trim().is_empty();
+    let any_auth = api_key_set || !user_api_keys_vec.is_empty() || dashboard_auth_enabled;
+
+    // Resolve the effective value of `require_auth_for_reads`.
+    // - Explicit `Some(true)`  → operators are forcing the allowlist
+    //   closed even if auth is misconfigured (catches an accidental
+    //   `api_key = ""` redeploy).
+    // - Explicit `Some(false)` → operators are deliberately keeping the
+    //   reads allowlist open even when an `api_key` is set; typical
+    //   for deployments fronted by an external auth proxy.
+    // - `None` (default)       → derive from whether *any* authentication
+    //   is configured. This makes the safe default "set an api_key and
+    //   the reads allowlist closes automatically", instead of forcing
+    //   operators to remember a separate flag before reads stop leaking
+    //   agent IDs to the LAN.
+    let configured_require_auth_for_reads = state.kernel.config_ref().require_auth_for_reads;
+    let require_auth_for_reads =
+        derive_require_auth_for_reads(configured_require_auth_for_reads, any_auth);
+    if require_auth_for_reads && !any_auth {
+        tracing::warn!(
+            "require_auth_for_reads = true but no authentication is configured \
+             (api_key, user_api_keys, and dashboard credentials are all empty). \
+             The flag will have no effect — set an api_key or configure dashboard \
+             credentials to lock down read endpoints."
+        );
+    }
+    if require_auth_for_reads && configured_require_auth_for_reads.is_none() {
+        tracing::info!(
+            "require_auth_for_reads auto-enabled because authentication is configured \
+             (api_key / user_api_keys / dashboard credentials). Dashboard reads now \
+             require a bearer token. Set `require_auth_for_reads = false` in config.toml \
+             to restore the legacy public reads allowlist."
+        );
     }
     let auth_state = middleware::AuthState {
         api_key_lock: api_key_lock.clone(),
@@ -1317,6 +1390,20 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Resolve the effective value of `require_auth_for_reads` from the explicit
+/// config option and whether any authentication method is configured.
+///
+/// - `Some(explicit)` preserves the operator's stated intent verbatim.
+/// - `None` derives the value from `any_auth` so that setting any form of
+///   auth (api_key / user keys / dashboard credentials) automatically closes
+///   the dashboard reads allowlist.
+fn derive_require_auth_for_reads(configured: Option<bool>, any_auth: bool) -> bool {
+    match configured {
+        Some(explicit) => explicit,
+        None => any_auth,
+    }
+}
+
 /// Check if an LibreFang daemon is actually responding at the given address.
 /// This avoids false positives where a different process reused the same PID
 /// after a system reboot.
@@ -1334,5 +1421,30 @@ fn is_daemon_responding(addr: &str) -> bool {
         std::net::TcpStream::connect(addr_only)
             .map(|_| true)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod derive_require_auth_for_reads_tests {
+    use super::derive_require_auth_for_reads;
+
+    #[test]
+    fn none_with_auth_enables() {
+        assert!(derive_require_auth_for_reads(None, true));
+    }
+
+    #[test]
+    fn none_without_auth_disables() {
+        assert!(!derive_require_auth_for_reads(None, false));
+    }
+
+    #[test]
+    fn some_false_is_preserved_even_when_auth_configured() {
+        assert!(!derive_require_auth_for_reads(Some(false), true));
+    }
+
+    #[test]
+    fn some_true_is_preserved_even_when_no_auth_configured() {
+        assert!(derive_require_auth_for_reads(Some(true), false));
     }
 }
