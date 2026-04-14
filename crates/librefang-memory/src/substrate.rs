@@ -659,23 +659,42 @@ impl MemorySubstrate {
         .map_err(|e| LibreFangError::Internal(e.to_string()))?
     }
 
-    /// Claim the next pending task (optionally for a specific assignee). Returns task JSON or None.
-    pub async fn task_claim(&self, agent_id: &str) -> LibreFangResult<Option<serde_json::Value>> {
+    /// Claim the next pending task for this agent.
+    ///
+    /// A row matches if its `assigned_to` equals the caller's UUID, equals the
+    /// caller's registered display name (when provided), or is the empty string
+    /// (broadcast / unassigned). On successful claim the row's `assigned_to` is
+    /// rewritten to the UUID so ownership is canonical for the rest of the
+    /// task's lifecycle.
+    ///
+    /// `agent_name` is optional so call sites that have no name to pass (tests,
+    /// internal callers without a registry) keep working — `None` collapses to
+    /// the existing UUID-or-empty behaviour.
+    pub async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> LibreFangResult<Option<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let agent_id = agent_id.to_string();
+        // When the caller has no registered name, bind the name slot to an
+        // empty string — it collapses into the existing `assigned_to = ''`
+        // broadcast arm and leaves behaviour unchanged.
+        let agent_name = agent_name.unwrap_or("").to_string();
 
         tokio::task::spawn_blocking(move || {
             let db = conn.lock().map_err(|e| LibreFangError::Internal(e.to_string()))?;
-            // Find first pending task assigned to this agent, or any unassigned pending task
+            // Match on UUID, registered name, or the broadcast sentinel.
             let mut stmt = db.prepare(
                 "SELECT id, title, description, assigned_to, created_by, created_at
                  FROM task_queue
-                 WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
+                 WHERE status = 'pending'
+                   AND (assigned_to = ?1 OR assigned_to = ?2 OR assigned_to = '')
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1"
             ).map_err(|e| LibreFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![agent_id], |row| {
+            let result = stmt.query_row(rusqlite::params![agent_id, agent_name], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -687,8 +706,8 @@ impl MemorySubstrate {
             });
 
             match result {
-                Ok((id, title, description, assigned, created_by, created_at)) => {
-                    // Update status to in_progress
+                Ok((id, title, description, _assigned, created_by, created_at)) => {
+                    // Canonicalise ownership: rewrite assigned_to to the claimant UUID.
                     db.execute(
                         "UPDATE task_queue SET status = 'in_progress', assigned_to = ?2 WHERE id = ?1",
                         rusqlite::params![id, agent_id],
@@ -699,7 +718,7 @@ impl MemorySubstrate {
                         "title": title,
                         "description": description,
                         "status": "in_progress",
-                        "assigned_to": if assigned.is_empty() { &agent_id } else { &assigned },
+                        "assigned_to": &agent_id,
                         "created_by": created_by,
                         "created_at": created_at,
                     })))
@@ -1005,7 +1024,7 @@ mod tests {
             .unwrap();
 
         // Claim the task
-        let claimed = substrate.task_claim("auditor").await.unwrap();
+        let claimed = substrate.task_claim("auditor", None).await.unwrap();
         assert!(claimed.is_some());
         let claimed = claimed.unwrap();
         assert_eq!(claimed["id"], task_id);
@@ -1026,8 +1045,51 @@ mod tests {
     #[tokio::test]
     async fn test_task_claim_empty() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
-        let claimed = substrate.task_claim("nobody").await.unwrap();
+        let claimed = substrate.task_claim("nobody", None).await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_task_claim_matches_by_name() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let task_id = substrate
+            .task_post(
+                "Classify email",
+                "Assign label to inbox/42",
+                Some("email-classifier"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Claim as an agent whose UUID is different from the stored assignee string,
+        // but whose registered name matches "email-classifier".
+        let claimant_uuid = "11111111-2222-3333-4444-555555555555";
+        let claimed = substrate
+            .task_claim(claimant_uuid, Some("email-classifier"))
+            .await
+            .unwrap();
+        assert!(claimed.is_some(), "task should be claimable by agent name");
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed["id"], task_id);
+        assert_eq!(claimed["status"], "in_progress");
+        // After claim, assigned_to must be rewritten to the claimant's UUID so
+        // ownership is unambiguous for the rest of the task's lifecycle.
+        assert_eq!(claimed["assigned_to"], claimant_uuid);
+
+        // A second claim attempt with the same name should return None because
+        // the row was rewritten to the UUID in the UPDATE.
+        let second = substrate
+            .task_claim(
+                "99999999-9999-9999-9999-999999999999",
+                Some("email-classifier"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "already-claimed task should not re-match by name"
+        );
     }
 
     #[tokio::test]
