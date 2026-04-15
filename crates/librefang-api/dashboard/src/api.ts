@@ -45,6 +45,7 @@ export interface ProviderItem {
   latency_ms?: number;
   api_key_env?: string;
   base_url?: string;
+  proxy_url?: string;
   key_required?: boolean;
   health?: string;
   media_capabilities?: string[];
@@ -778,13 +779,14 @@ export interface AgentDetail {
   mode?: string;
   thinking?: { budget_tokens?: number; stream_thinking?: boolean };
   is_hand?: boolean;
+  web_search_augmentation?: "off" | "auto" | "always";
 }
 
 export async function getAgentDetail(agentId: string): Promise<AgentDetail> {
   return get<AgentDetail>(`/api/agents/${encodeURIComponent(agentId)}`);
 }
 
-export async function patchAgentConfig(agentId: string, config: { max_tokens?: number; model?: string; provider?: string; temperature?: number }): Promise<ApiActionResponse> {
+export async function patchAgentConfig(agentId: string, config: { max_tokens?: number; model?: string; provider?: string; temperature?: number; web_search_augmentation?: "off" | "auto" | "always" }): Promise<ApiActionResponse> {
   return patch<ApiActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/config`, config);
 }
 
@@ -952,8 +954,10 @@ export async function deleteProviderKey(providerId: string): Promise<ApiActionRe
   return del<ApiActionResponse>(`/api/providers/${encodeURIComponent(providerId)}/key`);
 }
 
-export async function setProviderUrl(providerId: string, baseUrl: string): Promise<ApiActionResponse> {
-  return put<ApiActionResponse>(`/api/providers/${encodeURIComponent(providerId)}/url`, { base_url: baseUrl });
+export async function setProviderUrl(providerId: string, baseUrl: string, proxyUrl?: string): Promise<ApiActionResponse> {
+  const body: Record<string, string> = { base_url: baseUrl };
+  if (proxyUrl !== undefined) body.proxy_url = proxyUrl;
+  return put<ApiActionResponse>(`/api/providers/${encodeURIComponent(providerId)}/url`, body);
 }
 
 export async function setDefaultProvider(providerId: string, model?: string): Promise<ApiActionResponse> {
