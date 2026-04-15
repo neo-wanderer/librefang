@@ -272,6 +272,7 @@ function TotpSection() {
           </div>
         </SettingRow>
 
+
         {status?.confirmed && status.remaining_recovery_codes <= 2 && (
           <div className="px-1 py-2 text-sm text-warning flex items-center gap-2">
             <Shield className="w-4 h-4 shrink-0" />

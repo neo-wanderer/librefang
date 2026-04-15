@@ -5,6 +5,37 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 
+## [2026.4.15] - 2026-04-15
+
+### Added
+
+- Add LIBREFANG_DASHBOARD_EMBEDDED_ONLY env var to pin dashboard to embedded assets (#2520) (@neo-wanderer)
+- Add TOTP scope selector in Settings (#2526) (@houko)
+- Add section tab switcher to config category pages (#2532) (@houko)
+- Add voice input button to ChatPage (#2533) (@houko)
+- Swap tab bar and page header positions in config pages (#2534) (@houko)
+- Polish config page layout and UX (#2535) (@houko)
+- Step-by-step provider creation wizard (#2544) (@houko)
+
+### Fixed
+
+- Scope telegram sessions per chat_id to prevent context leakage (#2349) (#2522) (@DaBlitzStein)
+- Honour silent flag in KernelBridgeAdapter sender methods (#2521) (#2523) (@DaBlitzStein)
+- Use is_some_and instead of map_or in webchat asset_path check (#2525) (@houko)
+- Move TOTP scope to ConfigPage via schema (#2527) (@houko)
+- Restore ready-for-review when blockers are cleared (#2528) (@houko)
+- Fall back to npm when pnpm is unavailable in dev command (#2529) (@houko)
+- Check review state before clearing needs-changes on push (#2530) (@houko)
+- Remove needless borrow in serde_json::to_value call (#2531) (@houko)
+- Show disabled mic button when STT not configured (#2536) (@houko)
+- Fix stale state bugs in provider config modal (#2537) (@houko)
+- Move field description to label column (#2538) (@houko)
+- Show field description below input/toggle (#2539) (@houko)
+- Save API key on provider creation and show remove button for all providers (#2540) (@houko)
+- Improve provider auto-detection accuracy and UX (#2542) (@houko)
+- Remove orphaned doc comment causing clippy failure on main (#2543) (@houko)
+
+
 ## [2026.4.14] - 2026-04-14
 
 ### Added

@@ -717,10 +717,20 @@ impl LibreFangKernel {
                 .map(|(id, base_url, key_env)| {
                     let kernel = Arc::clone(&self);
                     tokio::spawn(async move {
-                        let key = match std::env::var(&key_env) {
-                            Ok(k) if !k.trim().is_empty() => k,
-                            _ => return,
-                        };
+                        // Resolve the actual key via primary env var, alt env var,
+                        // and credential files. This is needed for AutoDetected
+                        // providers whose key lives in a fallback env var (e.g.
+                        // GOOGLE_API_KEY for gemini, not GEMINI_API_KEY).
+                        let key = librefang_runtime::drivers::resolve_provider_api_key(&id)
+                            .or_else(|| {
+                                std::env::var(&key_env)
+                                    .ok()
+                                    .filter(|k| !k.trim().is_empty())
+                            })
+                            .unwrap_or_default();
+                        if key.is_empty() {
+                            return;
+                        }
                         let result =
                             librefang_runtime::model_catalog::probe_api_key(&id, &base_url, &key)
                                 .await;
@@ -1718,6 +1728,8 @@ impl LibreFangKernel {
         // Initialize model catalog, detect provider auth, and apply URL overrides
         let mut model_catalog =
             librefang_runtime::model_catalog::ModelCatalog::new(&config.home_dir);
+        model_catalog.load_suppressed(&config.home_dir.join("suppressed_providers.json"));
+        model_catalog.load_overrides(&config.home_dir.join("model_overrides.json"));
         model_catalog.detect_auth();
         // Apply region selections first (lower priority than explicit provider_urls)
         if !config.provider_regions.is_empty() {
@@ -3659,10 +3671,18 @@ system_prompt = "You are a helpful assistant."
         }
 
         // LLM agent: true streaming via agent loop
-        // Derive session ID: channel-specific sessions are always deterministic
-        // per-channel. For non-channel invocations, respect the agent's session_mode.
+        // Derive session ID: channel-specific sessions are deterministic per
+        // (channel, chat_id). Including chat_id prevents context bleed between
+        // a group and a DM that share the same (agent, channel). For non-channel
+        // invocations, respect the agent's session_mode.
         let effective_session_id = match sender_context {
-            Some(ctx) if !ctx.channel.is_empty() => SessionId::for_channel(agent_id, &ctx.channel),
+            Some(ctx) if !ctx.channel.is_empty() => {
+                let scope = match &ctx.chat_id {
+                    Some(cid) if !cid.is_empty() => format!("{}:{}", ctx.channel, cid),
+                    _ => ctx.channel.clone(),
+                };
+                SessionId::for_channel(agent_id, &scope)
+            }
             _ => match entry.manifest.session_mode {
                 librefang_types::agent::SessionMode::Persistent => entry.session_id,
                 librefang_types::agent::SessionMode::New => SessionId::new(),
@@ -4773,12 +4793,19 @@ system_prompt = "You are a helpful assistant."
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::LibreFang)?;
 
-        // Derive session ID: channel-specific sessions are always deterministic
-        // per-channel and are not affected by session_mode. For non-channel
+        // Derive session ID: channel-specific sessions are deterministic per
+        // (channel, chat_id). Including chat_id prevents context bleed between
+        // a group and a DM that share the same (agent, channel). For non-channel
         // invocations (background ticks, triggers, agent_send), resolve the
         // effective session mode: per-trigger override > agent manifest default.
         let effective_session_id = match sender_context {
-            Some(ctx) if !ctx.channel.is_empty() => SessionId::for_channel(agent_id, &ctx.channel),
+            Some(ctx) if !ctx.channel.is_empty() => {
+                let scope = match &ctx.chat_id {
+                    Some(cid) if !cid.is_empty() => format!("{}:{}", ctx.channel, cid),
+                    _ => ctx.channel.clone(),
+                };
+                SessionId::for_channel(agent_id, &scope)
+            }
             _ => {
                 let mode = session_mode_override.unwrap_or(entry.manifest.session_mode);
                 match mode {
@@ -5066,6 +5093,45 @@ system_prompt = "You are a helpful assistant."
                             manifest.model.provider = entry.provider.clone();
                         }
                     }
+                }
+            }
+        }
+
+        // Apply per-model inference parameter overrides from the catalog.
+        // Placed AFTER model routing so overrides match the final model, not
+        // the pre-routing one (e.g. routing may switch sonnet → haiku).
+        // Priority: model overrides > agent manifest > system defaults.
+        {
+            let override_key = format!("{}:{}", manifest.model.provider, manifest.model.model);
+            let catalog = self.model_catalog.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(mo) = catalog.get_overrides(&override_key) {
+                if let Some(t) = mo.temperature {
+                    manifest.model.temperature = t;
+                }
+                if let Some(mt) = mo.max_tokens {
+                    manifest.model.max_tokens = mt;
+                }
+                let ep = &mut manifest.model.extra_params;
+                if let Some(tp) = mo.top_p {
+                    ep.insert("top_p".to_string(), serde_json::json!(tp));
+                }
+                if let Some(fp) = mo.frequency_penalty {
+                    ep.insert("frequency_penalty".to_string(), serde_json::json!(fp));
+                }
+                if let Some(pp) = mo.presence_penalty {
+                    ep.insert("presence_penalty".to_string(), serde_json::json!(pp));
+                }
+                if let Some(ref re) = mo.reasoning_effort {
+                    ep.insert("reasoning_effort".to_string(), serde_json::json!(re));
+                }
+                if mo.use_max_completion_tokens == Some(true) {
+                    ep.insert(
+                        "use_max_completion_tokens".to_string(),
+                        serde_json::json!(true),
+                    );
+                }
+                if mo.force_max_tokens == Some(true) {
+                    ep.insert("force_max_tokens".to_string(), serde_json::json!(true));
                 }
             }
         }
@@ -7314,6 +7380,42 @@ system_prompt = "You are a helpful assistant."
         // agents are picked up on the next routing call.
         router::invalidate_manifest_cache();
         router::invalidate_hand_route_cache();
+    }
+
+    /// Lightweight one-shot LLM call for classification tasks (e.g., reply precheck).
+    ///
+    /// Uses the default driver with low max_tokens and 0 temperature.
+    /// Returns `Err` on LLM error or timeout (caller should fail-open).
+    pub async fn one_shot_llm_call(&self, model: &str, prompt: &str) -> Result<String, String> {
+        use librefang_runtime::llm_driver::CompletionRequest;
+        use librefang_types::message::Message;
+
+        let request = CompletionRequest {
+            model: model.to_string(),
+            messages: vec![Message::user(prompt.to_string())],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            prompt_caching: false,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+        };
+
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.default_driver.complete(request),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(format!("LLM call failed: {e}")),
+            Err(_) => return Err("LLM call timed out (5s)".to_string()),
+        };
+
+        Ok(result.text())
     }
 
     /// Publish an event to the bus and evaluate triggers.
@@ -10459,10 +10561,27 @@ impl KernelHandle for LibreFangKernel {
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String> {
-        self.memory
+        let task_id = self
+            .memory
             .task_post(title, description, assigned_to, created_by)
             .await
-            .map_err(|e| format!("Task post failed: {e}"))
+            .map_err(|e| format!("Task post failed: {e}"))?;
+
+        let event = librefang_types::event::Event::new(
+            AgentId::new(), // system-originated
+            librefang_types::event::EventTarget::Broadcast,
+            librefang_types::event::EventPayload::System(
+                librefang_types::event::SystemEvent::TaskPosted {
+                    task_id: task_id.clone(),
+                    title: title.to_string(),
+                    assigned_to: assigned_to.map(String::from),
+                    created_by: created_by.map(String::from),
+                },
+            ),
+        );
+        self.publish_event(event).await;
+
+        Ok(task_id)
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
@@ -10481,17 +10600,49 @@ impl KernelHandle for LibreFangKernel {
                 }
             },
         };
-        self.memory
+        let result = self
+            .memory
             .task_claim(&resolved)
             .await
-            .map_err(|e| format!("Task claim failed: {e}"))
+            .map_err(|e| format!("Task claim failed: {e}"))?;
+
+        if let Some(ref task) = result {
+            let task_id = task["id"].as_str().unwrap_or("").to_string();
+            let event = librefang_types::event::Event::new(
+                AgentId::new(), // system-originated
+                librefang_types::event::EventTarget::Broadcast,
+                librefang_types::event::EventPayload::System(
+                    librefang_types::event::SystemEvent::TaskClaimed {
+                        task_id,
+                        claimed_by: resolved.clone(),
+                    },
+                ),
+            );
+            self.publish_event(event).await;
+        }
+
+        Ok(result)
     }
 
     async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String> {
         self.memory
             .task_complete(task_id, result)
             .await
-            .map_err(|e| format!("Task complete failed: {e}"))
+            .map_err(|e| format!("Task complete failed: {e}"))?;
+
+        let event = librefang_types::event::Event::new(
+            AgentId::new(), // system-originated
+            librefang_types::event::EventTarget::Broadcast,
+            librefang_types::event::EventPayload::System(
+                librefang_types::event::SystemEvent::TaskCompleted {
+                    task_id: task_id.to_string(),
+                    result: result.to_string(),
+                },
+            ),
+        );
+        self.publish_event(event).await;
+
+        Ok(())
     }
 
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
@@ -11870,6 +12021,9 @@ impl LibreFangKernel {
             allowed_tools: deferred.allowed_tools.as_deref(),
             caller_agent_id: Some(deferred.agent_id.as_str()),
             skill_registry: Some(skill_snapshot),
+            // Deferred tools have already passed the approval gate; skill
+            // allowlist is not available here so we skip the check (None).
+            allowed_skills: None,
             mcp_connections: Some(&self.mcp_connections),
             web_ctx: Some(&self.web_ctx),
             browser_ctx: Some(&self.browser_ctx),

@@ -17,6 +17,12 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
             "/models/custom/{*id}",
             axum::routing::delete(remove_custom_model),
         )
+        .route(
+            "/models/overrides/{*id}",
+            axum::routing::get(get_model_overrides)
+                .put(set_model_overrides)
+                .delete(delete_model_overrides),
+        )
         .route("/models/{*id}", axum::routing::get(get_model))
         .route("/providers", axum::routing::get(list_providers))
         .route("/catalog/update", axum::routing::post(catalog_update))
@@ -128,6 +134,7 @@ pub async fn list_models(
                 "supports_vision": m.supports_vision,
                 "supports_streaming": m.supports_streaming,
                 "supports_thinking": m.supports_thinking,
+                "aliases": m.aliases,
                 "available": available,
             })
         })
@@ -260,6 +267,8 @@ pub async fn get_model(
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status.is_available())
                 .unwrap_or(m.tier == librefang_types::model_catalog::ModelTier::Custom);
+            let override_key = format!("{}:{}", m.provider, m.id);
+            let overrides = catalog.get_overrides(&override_key);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -276,11 +285,77 @@ pub async fn get_model(
                     "supports_streaming": m.supports_streaming,
                     "aliases": m.aliases,
                     "available": available,
+                    "overrides": overrides,
                 })),
             )
         }
         None => ApiErrorResponse::not_found(format!("Model '{}' not found", id)).into_json_tuple(),
     }
+}
+
+// ── Per-model overrides ─────────────────────────────────────────────────────
+
+/// GET /api/models/overrides/{id} — Get inference parameter overrides for a model.
+pub async fn get_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let catalog = state
+        .kernel
+        .model_catalog_ref()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    match catalog.get_overrides(&id) {
+        Some(o) => (StatusCode::OK, Json(serde_json::to_value(o).unwrap())),
+        None => (StatusCode::OK, Json(serde_json::json!({}))),
+    }
+}
+
+/// PUT /api/models/overrides/{id} — Set inference parameter overrides for a model.
+pub async fn set_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<librefang_types::model_catalog::ModelOverrides>,
+) -> impl IntoResponse {
+    let overrides_path = state.kernel.home_dir().join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = catalog.get_overrides(&id).cloned();
+    catalog.set_overrides(id.clone(), body);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+        // Roll back in-memory change so catalog stays consistent with disk.
+        match previous {
+            Some(prev) => catalog.set_overrides(id, prev),
+            None => {
+                catalog.remove_overrides(&id);
+            }
+        }
+        return ApiErrorResponse::internal(format!("Failed to persist overrides: {e}"))
+            .into_json_tuple();
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// DELETE /api/models/overrides/{id} — Remove inference parameter overrides for a model.
+pub async fn delete_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let overrides_path = state.kernel.home_dir().join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    catalog.remove_overrides(&id);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 /// Attach local-provider probe results to a JSON entry and optionally merge
@@ -777,13 +852,18 @@ pub async fn set_provider_key(
     // Set env var in current process so detect_auth picks it up
     std::env::set_var(&env_var, &key);
 
-    // Refresh auth detection (sync, sets status to Configured if non-empty)
-    state
-        .kernel
-        .model_catalog_ref()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .detect_auth();
+    // Re-enable fallback detection (user is adding a key, undo any prior suppress)
+    // and refresh auth status.
+    {
+        let mut catalog = state
+            .kernel
+            .model_catalog_ref()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.unsuppress_provider(&name);
+        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.detect_auth();
+    }
 
     // Kick off a background probe to validate the new key immediately so the
     // dashboard reflects ValidatedKey / InvalidKey without waiting for restart.
@@ -966,13 +1046,17 @@ pub async fn delete_provider_key(
     // Remove from process environment
     std::env::remove_var(&env_var);
 
-    // Refresh auth detection
-    state
-        .kernel
-        .model_catalog_ref()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .detect_auth();
+    // Suppress fallback/CLI detection for this provider and refresh auth
+    {
+        let mut catalog = state
+            .kernel
+            .model_catalog_ref()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.suppress_provider(&name);
+        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.detect_auth();
+    }
 
     (
         StatusCode::OK,
@@ -1298,7 +1382,18 @@ pub async fn set_provider_url(
 pub async fn set_default_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    body: Option<axum::Json<serde_json::Value>>,
 ) -> impl IntoResponse {
+    // Accept optional {"model": "model-id"} body to override the auto-selected model.
+    // This is needed for providers like ollama where models are dynamic and may
+    // not be in the static catalog.
+    let user_model = body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(String::from);
+
     // Verify the provider exists in the catalog
     let (default_model, env_var) = {
         let catalog = state
@@ -1313,7 +1408,7 @@ pub async fn set_default_provider(
                     .into_json_tuple();
             }
         };
-        let model_id = catalog.default_model_for_provider(&name);
+        let model_id = user_model.or_else(|| catalog.default_model_for_provider(&name));
         (model_id, provider.api_key_env.clone())
     };
 
@@ -1321,7 +1416,7 @@ pub async fn set_default_provider(
         Some(id) => id,
         None => {
             return ApiErrorResponse::bad_request(format!(
-                "No models found for provider '{}'",
+                "No models found for provider '{}'. Specify a model in the request body: {{\"model\": \"model-name\"}}",
                 name
             ))
             .into_json_tuple();

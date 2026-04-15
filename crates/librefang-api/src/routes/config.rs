@@ -879,6 +879,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "path": config.vault.path.as_ref().map(|p| p.to_string_lossy().to_string()),
     });
 
+    let stt_available = config.media.audio_provider.is_some();
     set!("media", {
         "image_description": config.media.image_description,
         "audio_transcription": config.media.audio_transcription,
@@ -886,6 +887,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "max_concurrency": config.media.max_concurrency,
         "image_provider": config.media.image_provider,
         "audio_provider": config.media.audio_provider,
+        "audio_model": config.media.audio_model,
+        "stt_available": stt_available,
     });
 
     set!("links", {
@@ -918,6 +921,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "timeout_secs": config.approval.timeout_secs,
         "auto_approve_autonomous": config.approval.auto_approve_autonomous,
         "auto_approve": config.approval.auto_approve,
+        "second_factor": serde_json::to_value(config.approval.second_factor).unwrap_or(serde_json::json!("none")),
+        "totp_issuer": config.approval.totp_issuer,
     });
 
     set!("exec_policy", {
@@ -1633,7 +1638,9 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
     sec!("media", { "fields": {
         "image_description": "boolean", "audio_transcription": "boolean",
         "video_description": "boolean", "max_concurrency": "number",
-        "image_provider": "string", "audio_provider": "string"
+        "image_provider": "string",
+        "audio_provider": { "type": "select", "options": ["", "groq", "openai", "gemini", "elevenlabs", "minimax", "fireworks", "together", "siliconflow"] },
+        "audio_model": "string"
     }});
     sec!("links", { "fields": {
         "enabled": "boolean", "max_links": "number",
@@ -1649,7 +1656,9 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }});
     sec!("approval", { "hot_reloadable": true, "fields": {
         "require_approval": "string[]", "timeout_secs": "number",
-        "auto_approve_autonomous": "boolean", "auto_approve": "boolean"
+        "auto_approve_autonomous": "boolean", "auto_approve": "boolean",
+        "second_factor": { "type": "select", "options": ["none", "totp", "login", "both"] },
+        "totp_issuer": "string"
     }});
     sec!("exec_policy", { "fields": {
         "mode": { "type": "select", "options": ["deny", "allowlist", "full"] },
