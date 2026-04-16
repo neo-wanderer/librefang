@@ -1762,6 +1762,15 @@ fn build_prompt_setup(ctx: PromptSetupContext<'_>) -> PromptSetup {
         None
     };
 
+    // Instruct the model to match the user's language for both thinking and
+    // response. Applied unconditionally so it covers models that generate
+    // reasoning traces without an explicit thinking config (e.g. Gemma4,
+    // Qwen3 via Ollama). Models that cannot follow this instruction are
+    // unaffected.
+    system_prompt.push_str(
+        "\n\nIMPORTANT: Always use the same language as the user's message for both your thinking process and your response.",
+    );
+
     PromptSetup {
         system_prompt,
         memory_context_msg,
@@ -8422,23 +8431,28 @@ mod tests {
 
     #[test]
     fn test_should_augment_web_search_off() {
-        let manifest = AgentManifest::default();
-        // Default is Off
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Off,
+            ..Default::default()
+        };
         assert!(!should_augment_web_search(&manifest));
     }
 
     #[test]
     fn test_should_augment_web_search_always() {
-        let mut manifest = AgentManifest::default();
-        manifest.web_search_augmentation =
-            librefang_types::agent::WebSearchAugmentationMode::Always;
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Always,
+            ..Default::default()
+        };
         assert!(should_augment_web_search(&manifest));
     }
 
     #[test]
     fn test_should_augment_web_search_auto_with_tools() {
-        let mut manifest = AgentManifest::default();
-        manifest.web_search_augmentation = librefang_types::agent::WebSearchAugmentationMode::Auto;
+        let mut manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
         // model_supports_tools = true → don't augment
         manifest.metadata.insert(
             "model_supports_tools".to_string(),
@@ -8449,8 +8463,10 @@ mod tests {
 
     #[test]
     fn test_should_augment_web_search_auto_without_tools() {
-        let mut manifest = AgentManifest::default();
-        manifest.web_search_augmentation = librefang_types::agent::WebSearchAugmentationMode::Auto;
+        let mut manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
         // model_supports_tools = false → augment
         manifest.metadata.insert(
             "model_supports_tools".to_string(),
@@ -8461,8 +8477,10 @@ mod tests {
 
     #[test]
     fn test_should_augment_web_search_auto_no_metadata() {
-        let mut manifest = AgentManifest::default();
-        manifest.web_search_augmentation = librefang_types::agent::WebSearchAugmentationMode::Auto;
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
         // No metadata → assume tools supported → don't augment (conservative)
         assert!(!should_augment_web_search(&manifest));
     }
@@ -8503,11 +8521,11 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_default_web_search_augmentation_is_off() {
+    fn test_manifest_default_web_search_augmentation_is_auto() {
         let manifest = AgentManifest::default();
         assert_eq!(
             manifest.web_search_augmentation,
-            librefang_types::agent::WebSearchAugmentationMode::Off,
+            librefang_types::agent::WebSearchAugmentationMode::Auto,
         );
     }
 
@@ -8532,7 +8550,7 @@ mod tests {
         let manifest: AgentManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(
             manifest.web_search_augmentation,
-            librefang_types::agent::WebSearchAugmentationMode::Off,
+            librefang_types::agent::WebSearchAugmentationMode::Auto,
         );
     }
 }

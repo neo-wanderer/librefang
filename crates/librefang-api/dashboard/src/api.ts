@@ -177,6 +177,7 @@ export interface DashboardSnapshot {
   agents: AgentItem[];
   skillCount: number;
   workflowCount: number;
+  webSearchAvailable: boolean;
 }
 
 export interface AgentIdentity {
@@ -201,6 +202,7 @@ export interface AgentItem {
   profile?: string;
   identity?: AgentIdentity;
   is_hand?: boolean;
+  web_search_augmentation?: "off" | "auto" | "always";
 }
 
 export interface PaginatedResponse<T> {
@@ -592,7 +594,7 @@ export function getStoredApiKey(): string {
   return localStorage.getItem("librefang-api-key") || "";
 }
 
-function authHeader(): HeadersInit {
+export function authHeader(): HeadersInit {
   const lang = localStorage.getItem("i18nextLng") || navigator.language || "en";
   const token = getStoredApiKey();
   const headers: HeadersInit = { "Accept-Language": lang };
@@ -747,6 +749,7 @@ export async function loadDashboardSnapshot(): Promise<DashboardSnapshot> {
     channels: ChannelItem[];
     skillCount: number;
     workflowCount: number;
+    webSearchAvailable: boolean;
   }>("/api/dashboard/snapshot");
 
   return {
@@ -757,6 +760,7 @@ export async function loadDashboardSnapshot(): Promise<DashboardSnapshot> {
     channels: snap.channels ?? [],
     skillCount: snap.skillCount ?? 0,
     workflowCount: snap.workflowCount ?? 0,
+    webSearchAvailable: snap.webSearchAvailable ?? false,
   };
 }
 
@@ -1530,7 +1534,10 @@ export async function getFullConfig(): Promise<Record<string, unknown>> {
 
 export interface ConfigFieldSchema {
   type?: string;
-  options?: (string | { id: string; name: string; provider: string })[];
+  options?: (string | { id: string; name: string; provider: string } | { value: string; label: string })[];
+  min?: number;
+  max?: number;
+  step?: number;
 }
 
 export interface ConfigSectionSchema {
