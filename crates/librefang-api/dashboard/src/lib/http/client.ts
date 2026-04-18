@@ -40,6 +40,7 @@ export {
   getFullConfig,
   getConfigSchema,
   fetchRegistrySchema,
+  getRawConfigToml,
   // goals
   listGoals,
   listGoalTemplates,
@@ -51,9 +52,13 @@ export {
   getHandStats,
   getHandSession,
   getHandInstanceStatus,
+  getHandManifestToml,
   // mcp
   listMcpServers,
-  listAvailableIntegrations,
+  getMcpServer,
+  listMcpCatalog,
+  getMcpCatalogEntry,
+  getMcpHealth,
   // memory
   listMemories,
   searchMemories,
@@ -89,6 +94,8 @@ export {
   listWorkflowRuns,
   getWorkflowRun,
   listWorkflowTemplates,
+  // terminal
+  listTerminalWindows,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -143,6 +150,8 @@ export {
   addMcpServer,
   updateMcpServer,
   deleteMcpServer,
+  reconnectMcpServer,
+  reloadMcp,
   // memory
   addMemoryFromText,
   updateMemory,
@@ -182,6 +191,10 @@ export {
   updateWorkflow,
   instantiateTemplate,
   saveWorkflowAsTemplate,
+  // terminal
+  createTerminalWindow,
+  renameTerminalWindow,
+  deleteTerminalWindow,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -196,4 +209,5 @@ export type {
   HandStatsResponse,
   MemoryItem,
   ModelOverrides,
+  TerminalWindow,
 } from "../../api";

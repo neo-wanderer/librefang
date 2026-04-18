@@ -60,6 +60,8 @@ export const commsKeys = {
 export const skillKeys = {
   all: ["skills"] as const,
   lists: () => [...skillKeys.all, "list"] as const,
+  details: () => [...skillKeys.all, "detail"] as const,
+  detail: (name: string) => [...skillKeys.details(), name] as const,
 };
 
 export const clawhubKeys = {
@@ -105,6 +107,8 @@ export const handKeys = {
     [...handKeys.all, "session", instanceId] as const,
   instanceStatus: (instanceId: string) =>
     [...handKeys.all, "instanceStatus", instanceId] as const,
+  manifest: (handId: string) =>
+    [...handKeys.all, "manifest", handId] as const,
 };
 
 export const workflowKeys = {
@@ -249,7 +253,10 @@ export const mediaKeys = {
 export const mcpKeys = {
   all: ["mcp"] as const,
   servers: () => [...mcpKeys.all, "servers"] as const,
-  integrations: () => [...mcpKeys.all, "integrations"] as const,
+  server: (id: string) => [...mcpKeys.servers(), id] as const,
+  catalog: () => [...mcpKeys.all, "catalog"] as const,
+  catalogEntry: (id: string) => [...mcpKeys.catalog(), id] as const,
+  health: () => [...mcpKeys.all, "health"] as const,
 };
 
 export const pluginKeys = {
@@ -262,6 +269,7 @@ export const configKeys = {
   all: ["config"] as const,
   full: () => [...configKeys.all, "full"] as const,
   schema: () => [...configKeys.all, "schema"] as const,
+  rawToml: () => [...configKeys.all, "rawToml"] as const,
 };
 
 export const registryKeys = {
