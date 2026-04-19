@@ -194,13 +194,15 @@ function TotpSection() {
   async function handleSetup(currentCode?: string) {
     setLoading(true);
     setError(null);
+    setSuccess(null);
     try {
       const data = await totpSetup(currentCode);
       setSetupData({ otpauth_uri: data.otpauth_uri, secret: data.secret, qr_code: data.qr_code, recovery_codes: data.recovery_codes });
       setShowResetPrompt(false);
       setResetCode("");
+      statusQuery.refetch();
     } catch (e: any) {
-      setError(e.message || "Setup failed");
+      setError(e.message || t("settings.totp_setup_failed", "Setup failed"));
     } finally {
       setLoading(false);
     }
@@ -220,14 +222,15 @@ function TotpSection() {
     if (!revokeCode) return;
     setLoading(true);
     setError(null);
+    setSuccess(null);
     try {
       await totpRevoke(revokeCode);
-      setSuccess("TOTP revoked. Set second_factor = \"none\" in config.");
+      setSuccess(t("settings.totp_revoked_success", "TOTP revoked. Set second_factor = \"none\" in config."));
       setShowRevokePrompt(false);
       setRevokeCode("");
       statusQuery.refetch();
     } catch (e: any) {
-      setError(e.message || "Revoke failed");
+      setError(e.message || t("settings.totp_revoke_failed", "Revoke failed"));
     } finally {
       setLoading(false);
     }
@@ -237,14 +240,15 @@ function TotpSection() {
     if (confirmCode.length !== 6) return;
     setLoading(true);
     setError(null);
+    setSuccess(null);
     try {
       await totpConfirm(confirmCode);
-      setSuccess("TOTP confirmed. Set second_factor = \"totp\" in config to enforce.");
+      setSuccess(t("settings.totp_confirmed_success", "TOTP confirmed. Set second_factor = \"totp\" in config to enforce."));
       setSetupData(null);
       setConfirmCode("");
       statusQuery.refetch();
     } catch (e: any) {
-      setError(e.message || "Invalid code");
+      setError(e.message || t("settings.totp_invalid_code", "Invalid code"));
     } finally {
       setLoading(false);
     }
@@ -656,6 +660,57 @@ function AutoDreamAgentRow({
             <p className="text-[11px] text-red-500">
               <XCircle className="w-3 h-3 inline mr-1" />
               {progress.error}
+            </p>
+          )}
+          {/* Cache-hit visibility. Since the forkedAgent migration, dreams
+              fork off the parent turn and hit Anthropic's prompt cache on
+              the (system + tools + messages) prefix. Surfacing the hit
+              rate here lets operators see the actual cost win — the
+              whole reason the forkedAgent PR exists. Only shown for
+              completed dreams (usage is populated then) and only when
+              there actually was input (avoids 0/0 noise). */}
+          {progress.usage && progress.usage.input_tokens > 0 && (
+            <p className="text-[10px] text-text-dim">
+              <span className="uppercase tracking-wider">
+                {t("settings.auto_dream_cache", "Cache")}:
+              </span>{" "}
+              {(() => {
+                const u = progress.usage!;
+                const totalIn =
+                  u.input_tokens +
+                  u.cache_read_input_tokens +
+                  u.cache_creation_input_tokens;
+                const hitPct =
+                  totalIn > 0
+                    ? Math.round((u.cache_read_input_tokens / totalIn) * 100)
+                    : 0;
+                return (
+                  <span
+                    title={t(
+                      "settings.auto_dream_cache_title",
+                      "Prompt cache hit rate for this dream — higher means more of the prefix came from Anthropic's cache instead of being re-billed.",
+                    )}
+                  >
+                    <span className="font-mono">{hitPct}%</span>
+                    {" "}
+                    ({u.cache_read_input_tokens.toLocaleString()}/
+                    {totalIn.toLocaleString()} tok)
+                  </span>
+                );
+              })()}
+              {typeof progress.usage.cost_usd === "number" && (
+                <>
+                  {" · "}
+                  <span
+                    title={t(
+                      "settings.auto_dream_cost_title",
+                      "Measured provider cost for this dream turn (input + output, cached tokens billed at the reduced rate).",
+                    )}
+                  >
+                    ${progress.usage.cost_usd.toFixed(5)}
+                  </span>
+                </>
+              )}
             </p>
           )}
         </div>
