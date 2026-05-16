@@ -3971,7 +3971,10 @@ async fn tool_apply_patch(
 /// Resolve `[tool_results]` spill threshold + per-artifact cap from raw
 /// `ToolExecContext` fields, falling back to compiled defaults when the
 /// caller passed `0` (test call sites that don't populate the ctx).
-fn resolve_spill_config(spill_threshold_bytes: u64, max_artifact_bytes: u64) -> (u64, u64) {
+pub(crate) fn resolve_spill_config(
+    spill_threshold_bytes: u64,
+    max_artifact_bytes: u64,
+) -> (u64, u64) {
     (
         if spill_threshold_bytes == 0 {
             16_384 // ToolResultsConfig::default().spill_threshold_bytes
