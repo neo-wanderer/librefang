@@ -63,24 +63,17 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::types::ApiErrorResponse;
 
-/// Resolve the LibreFang home directory without depending on the kernel crate.
-///
-/// Mirrors `librefang_kernel::config::librefang_home`:
-/// `LIBREFANG_HOME` env var takes priority, otherwise `~/.librefang`
-/// (falling back to the system temp dir if no home directory is available).
-fn librefang_home() -> PathBuf {
-    if let Ok(home) = std::env::var("LIBREFANG_HOME") {
-        return PathBuf::from(home);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".librefang")
-}
+// All channel handlers below resolve the LibreFang home directory via
+// `state.kernel.home_dir()` so they honour the kernel's authoritative
+// `KernelConfig.home_dir` setting (which itself respects `LIBREFANG_HOME`
+// and falls back to `~/.librefang`). The previously-local
+// `librefang_home()` helper was removed because it bypassed kernel config
+// overrides — see codex review fix #1 and its generalization in fix #7.
+
 // ---------------------------------------------------------------------------
 // Channel status endpoints — data-driven registry for all 40 adapters
 // ---------------------------------------------------------------------------
@@ -1413,6 +1406,17 @@ pub async fn configure_sidecar_channel(
         //     those out by reading the on-disk `secrets.env` once: a
         //     key already in `secrets.env` means the env presence is
         //     our own boot-time write, not a shell shadow.
+        // KEY-only extraction: this set is used purely for membership
+        // checks against the schema's secret field names (i.e. "is
+        // TELEGRAM_BOT_TOKEN listed in secrets.env?"). Quotes never
+        // appear inside dotenv KEYS, so the parser here intentionally
+        // mirrors `librefang_channels::sidecar::parse_secrets_env`'s
+        // key-extraction path but skips the value-side quote-stripping
+        // that `parse_secrets_env` performs. If a future change starts
+        // comparing VALUES here, switch to invoking the channels-crate
+        // helper directly so quote/whitespace handling stays consistent
+        // with how the sidecar actually inherits env vars at spawn time
+        // (codex review fix #9).
         let secrets_env_keys: std::collections::HashSet<String> = std::fs::read_to_string(
             &secrets_path,
         )
@@ -1474,6 +1478,20 @@ pub async fn configure_sidecar_channel(
         // 5. Upsert the [[sidecar_channels]] block keyed by adapter name.
         //    Idempotent: a second POST with the same name replaces the
         //    block in-place, preserving formatting of every other section.
+        //    `managed_env_keys` is the form's set of NON-SECRET schema
+        //    fields — i.e. the keys the configure form is the source of
+        //    truth for. Every OTHER env key already in the block (operator
+        //    hand-edits such as `PYTHONPATH`, `HTTP_PROXY`, locale vars,
+        //    or even a hand-edited `TELEGRAM_BOT_TOKEN` inline) is
+        //    preserved untouched. Secret schema fields never appear in
+        //    config.toml at all — they live in `secrets.env` — so they
+        //    are intentionally excluded from this set.
+        let managed_env_keys: Vec<&str> = schema
+            .fields
+            .iter()
+            .filter(|f| f.field_type != "secret")
+            .map(|f| f.key.as_str())
+            .collect();
         super::sidecar_toml::upsert_sidecar_block(
             &config_path,
             entry.name,
@@ -1481,6 +1499,7 @@ pub async fn configure_sidecar_channel(
             entry.command,
             entry.args,
             &nonsecret_env,
+            &managed_env_keys,
         )
         .map_err(|e| {
             ApiErrorResponse::internal(format!("failed to write config.toml: {e}"))
@@ -2088,7 +2107,7 @@ pub async fn configure_channel(
         None => return ApiErrorResponse::bad_request("Missing 'fields' object").into_json_tuple(),
     };
 
-    let home = librefang_home();
+    let home = state.kernel.home_dir().to_path_buf();
     let secrets_path = home.join("secrets.env");
     let config_path = home.join("config.toml");
     let mut config_fields: HashMap<String, (String, FieldType)> = HashMap::new();
@@ -2207,7 +2226,7 @@ pub async fn remove_channel(
         None => return ApiErrorResponse::not_found("Unknown channel").into_json_tuple(),
     };
 
-    let home = librefang_home();
+    let home = state.kernel.home_dir().to_path_buf();
     let secrets_path = home.join("secrets.env");
     let config_path = home.join("config.toml");
 
@@ -2667,7 +2686,7 @@ pub async fn create_channel_instance(
         None => return ApiErrorResponse::bad_request("Missing 'fields' object").into_json_tuple(),
     };
 
-    let home = librefang_home();
+    let home = state.kernel.home_dir().to_path_buf();
     let secrets_path = home.join("secrets.env");
     let config_path = home.join("config.toml");
 
@@ -2806,7 +2825,7 @@ pub async fn update_channel_instance_handler(
         })
         .unwrap_or_default();
 
-    let home = librefang_home();
+    let home = state.kernel.home_dir().to_path_buf();
     let secrets_path = home.join("secrets.env");
     let config_path = home.join("config.toml");
 
@@ -2991,7 +3010,7 @@ pub async fn delete_channel_instance(
         }
     };
 
-    let home = librefang_home();
+    let home = state.kernel.home_dir().to_path_buf();
     let config_path = home.join("config.toml");
 
     {
