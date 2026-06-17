@@ -14,6 +14,7 @@
 //! - `ProactiveMemoryHooks`: Auto-memorize and auto-retrieve hooks
 //! - `ProactiveMemoryStore`: Implementation on top of MemorySubstrate
 
+pub mod channel_binding_store;
 pub mod chunker;
 pub mod consolidation;
 pub mod decay;
@@ -37,6 +38,7 @@ pub mod workflow_store;
 
 mod session_store;
 mod substrate;
+pub use channel_binding_store::ChannelBindingStore;
 pub use goal_run_store::{GoalRunRow, GoalRunStore};
 pub use mcp_config_store::McpConfigStore;
 pub use passkey_store::{PasskeyRecord, PasskeyStore, PasskeyStoreError, SqlitePasskeyStore};
