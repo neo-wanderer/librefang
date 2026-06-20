@@ -196,24 +196,18 @@ pub(super) async fn tool_shell_exec(
                 reg.mark_finished(pid, exit_code);
             }
 
-            let stdout_str = if stdout.len() > max_output {
-                format!(
-                    "{}...\n[truncated, {} total bytes]",
-                    crate::str_utils::safe_truncate_str(&stdout, max_output),
-                    stdout.len()
-                )
-            } else {
-                stdout.to_string()
-            };
-            let stderr_str = if stderr.len() > max_output {
-                format!(
-                    "{}...\n[truncated, {} total bytes]",
-                    crate::str_utils::safe_truncate_str(&stderr, max_output),
-                    stderr.len()
-                )
-            } else {
-                stderr.to_string()
-            };
+            let stdout_str = super::spill::spill_or_passthrough(
+                "shell_exec",
+                stdout.to_string(),
+                max_output as u64,
+                crate::artifact_store::DEFAULT_MAX_ARTIFACT_BYTES,
+            );
+            let stderr_str = super::spill::spill_or_passthrough(
+                "shell_exec",
+                stderr.to_string(),
+                max_output as u64,
+                crate::artifact_store::DEFAULT_MAX_ARTIFACT_BYTES,
+            );
 
             Ok(format!(
                 "Exit code: {exit_code}\n\nSTDOUT:\n{stdout_str}\nSTDERR:\n{stderr_str}"

@@ -866,6 +866,9 @@ _308 PRs from 7 contributors since v2026.5.17-beta.12._
 
 ### Changed
 
+- **fix(runtime): spill oversized `shell_exec` output to the artifact store instead of lossily truncating it** (#6242) (@houko).
+  `shell_exec` capped each of stdout/stderr at `max_output_bytes` (default 100 KB) with `safe_truncate_str` and an `[truncated, N total bytes]` note, so the dropped middle of a long run (e.g. a 25k-line test log) was unrecoverable — the universal artifact spill never saw those bytes because the tool truncated them first.
+  Oversized streams now route through `artifact_store::maybe_spill`, yielding a compact stub the agent can page back in full via `read_artifact`, closing the only place the artifact store leaked information.
 - **dashboard(agents): drop the arbitrary 200000 cap on the model `max_tokens` input** (#6209) (@houko).
   The agent model-config `max_tokens` field hard-capped its input at `max={200000}`, silently preventing operators from setting a higher output budget; the provider validates the real per-model ceiling anyway, so the UI no longer imposes its own arbitrary limit (`min={1}` is kept).
   Closes #6209.
