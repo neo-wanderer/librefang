@@ -1,0 +1,25 @@
+sdk/python/librefang/sidecar/adapters/slack.py
+  s_8b246dcdc3c176::t_44b52cddcf5c37 877-879
+  s_8b246dcdc3c176::t_dc63907e895b02 938-941,944-994,999-1013,1018-1019,1022,1025-1026,1028-1030
+  s_8b246dcdc3c176::t_0b128b839a462d 70
+  s_8b246dcdc3c176::t_c63d23542d9cea 888
+  s_8b246dcdc3c176::t_da2f80d8181695 928-937,942-943,995-998,1014-1017,1020-1021,1023-1024,1027,1031-1051
+sdk/python/tests/test_slack_adapter.py
+  s_8b246dcdc3c176::t_28a1375a48e03d 1045-1115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "55cdfb6ddc84dbd163506e40a3d185550e743628",
+  "prompts": {},
+  "sessions": {
+    "s_8b246dcdc3c176": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e1c2f061-060d-4fe1-906c-6194c75fb596",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Vignesh Jagadeesh <vignesh.jagadeesh@freshworks.com>"
+    }
+  }
+}
