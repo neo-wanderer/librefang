@@ -1119,7 +1119,16 @@ pub async fn execute_tool_raw(
         }
 
         // Persistent process tools.
-        "process_start" => tool_process_start(input, *process_manager, *caller_agent_id).await,
+        "process_start" => {
+            tool_process_start(
+                input,
+                *process_manager,
+                *caller_agent_id,
+                *exec_policy,
+                *dangerous_command_checker,
+            )
+            .await
+        }
         "process_poll" => tool_process_poll(input, *process_manager).await,
         "process_write" => tool_process_write(input, *process_manager).await,
         "process_kill" => tool_process_kill(input, *process_manager).await,
@@ -1323,7 +1332,7 @@ pub async fn execute_tool_raw(
             }
             // Fallback 2: Skill registry tool providers
             else if let Some(registry) = skill_registry {
-                if let Some(skill) = registry.find_tool_provider(other) {
+                if let Some(skill) = registry.find_tool_provider(other, *allowed_skills) {
                     if let Some(allowed) = allowed_skills {
                         if !allowed.is_empty() && !allowed.contains(&skill.manifest.skill.name) {
                             warn!(tool = other, "Skill not in agent's allowed_skills list");

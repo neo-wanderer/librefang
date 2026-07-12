@@ -176,7 +176,61 @@ fn is_owner_only_write(method: &axum::http::Method, path: &str) -> bool {
     if path == "/api/users" || path.starts_with("/api/users/") {
         return true;
     }
+    // Adding / updating / deleting an MCP server persists a config entry that
+    // `connect_mcp_servers()` immediately spawns — a stdio transport is a raw
+    // `command` + `args` executed under the daemon UID. That is process spawn,
+    // the exact privilege install-deps above is Owner-gated to protect, so an
+    // Admin ("config write" by design) must not be able to reach it (finding
+    // #3). Gate ONLY the config-mutation verbs: `POST /api/mcp/servers` (add)
+    // and `PUT` / `DELETE /api/mcp/servers/{name}` (update / remove). GET
+    // (list / detail) stays at the generic Admin-or-above read gate, and the
+    // `{name}/reconnect|taint|auth/*` sub-resources — which do not introduce a
+    // new spawn command — keep their existing Admin gate. The `{name}` target
+    // is matched by requiring a single trailing segment with no further `/`,
+    // so the deeper sub-resource paths are excluded.
+    if *method == axum::http::Method::POST && path == "/api/mcp/servers" {
+        return true;
+    }
+    if (*method == axum::http::Method::PUT || *method == axum::http::Method::DELETE)
+        && path.starts_with("/api/mcp/servers/")
+        && !path["/api/mcp/servers/".len()..].contains('/')
+    {
+        return true;
+    }
     false
+}
+
+/// Minimum [`UserRole`] required for a privileged GET endpoint, or `None`
+/// for an ordinary read.
+///
+/// Some routes are registered as `GET` (a WebSocket upgrade is an HTTP GET,
+/// and tmux window listing is a GET) but perform a privileged, non-read
+/// action once connected. [`user_role_allows_request`] otherwise treats every
+/// GET as read-only and allows all roles, which would let a `Viewer` obtain
+/// capabilities the RBAC model denies. This helper is consulted BEFORE that
+/// blanket rule so the resolved role is checked against the real capability:
+///
+/// - `/api/terminal/ws` and `/api/terminal/windows[/…]` open / manage an
+///   interactive PTY under the daemon UID — process spawn, an Admin action
+///   (mirrors the install-deps boundary). A `Viewer`/`User` key must not get
+///   a shell (finding #4).
+/// - `/api/agents/{id}/ws` accepts inbound messages that drive a full agent
+///   turn (LLM calls, tool execution, budget spend) — the same capability the
+///   REST `POST /api/agents/{id}/message` grants, which requires `User`+. A
+///   `Viewer` is read-only and must not drive turns over the WS either
+///   (finding #11).
+///
+/// `path` must already be normalized (version prefix stripped, no trailing
+/// slash); the id/window segments are concrete here (this runs on the request
+/// URI, not the route template), so agent WS is matched by prefix + suffix.
+fn min_role_for_privileged_get(path: &str) -> Option<UserRole> {
+    if path == "/api/terminal/ws" || path.starts_with("/api/terminal/windows") {
+        return Some(UserRole::Admin);
+    }
+    if path.starts_with("/api/agents/") && path.ends_with("/ws") {
+        return Some(UserRole::User);
+    }
+    None
 }
 
 /// Whitelist check for per-user API-key access.
@@ -190,12 +244,30 @@ fn is_owner_only_write(method: &axum::http::Method, path: &str) -> bool {
 /// - `Viewer`: GET only.
 /// - All other methods (`PUT`/`DELETE`/`PATCH`) require `Admin`+.
 ///
+/// Exception: a few routes are registered as `GET` but perform a privileged,
+/// non-read action on connect (WebSocket upgrades into a shell / agent turn,
+/// tmux window management). [`min_role_for_privileged_get`] gates those by
+/// role BEFORE the blanket GET rule, so "GET only" for `Viewer` still holds
+/// for genuine reads but not for those upgrade endpoints.
+///
 /// The `path` must already be normalized (no trailing slash, version prefix
 /// stripped) before calling this function.
 fn user_role_allows_request(role: UserRole, method: &axum::http::Method, path: &str) -> bool {
     // Owner-only writes: even Admin cannot touch these.
     if is_owner_only_write(method, path) {
         return role >= UserRole::Owner;
+    }
+
+    // Privileged GET endpoints: a handful of routes are registered as `GET`
+    // (WebSocket upgrades, tmux window management) yet perform a non-read
+    // action on connect — spawn an interactive shell, drive an agent turn, or
+    // manage PTYs. The blanket `*method == GET => true` rule below assumes
+    // GET == read-only and would wave a Viewer straight through, so these must
+    // be role-gated FIRST.
+    if *method == axum::http::Method::GET {
+        if let Some(min_role) = min_role_for_privileged_get(path) {
+            return role >= min_role;
+        }
     }
 
     if role >= UserRole::Admin || *method == axum::http::Method::GET {
@@ -211,12 +283,19 @@ fn user_role_allows_request(role: UserRole, method: &axum::http::Method, path: &
         let agent_message = path.starts_with("/api/agents/")
             && (path.ends_with("/message") || path.ends_with("/message/stream"));
         let agent_clone = path.starts_with("/api/agents/") && path.ends_with("/clone");
+        // Anchor the approval suffixes to the `/api/approvals/` prefix. These
+        // suffixes are meant only for tool-call approval actions; left
+        // unanchored they also match `/api/skills/pending/{id}/approve` and
+        // `/api/a2a/agents/{id}/approve`, neither of which has an in-handler
+        // role check, so a User bearer could approve pending skills and trust
+        // A2A agents (privilege escalation).
         let approval_action = path == "/api/approvals/batch"
-            || path.ends_with("/approve")
-            || path.ends_with("/approve_all")
-            || path.ends_with("/reject")
-            || path.ends_with("/reject_all")
-            || path.ends_with("/modify");
+            || (path.starts_with("/api/approvals/")
+                && (path.ends_with("/approve")
+                    || path.ends_with("/approve_all")
+                    || path.ends_with("/reject")
+                    || path.ends_with("/reject_all")
+                    || path.ends_with("/modify")));
         return agent_message || agent_clone || approval_action;
     }
 
@@ -382,11 +461,43 @@ pub async fn accept_language(mut request: Request<Body>, next: Next) -> Response
 /// field automatically, so a single grep on `request_id=<uuid>` lights up
 /// the full execution path (HTTP → kernel → LLM provider).  This closes
 /// the propagation gap reported in #3775.
+/// Prometheus `path` label used for every request that did not match a route.
+///
+/// A single constant so all unmatched (404 / fallback) requests share one
+/// bounded series instead of one per distinct URI — see [`metric_path_label`]
+/// and its call site in [`request_logging`].
+const UNMATCHED_METRIC_PATH: &str = "<unmatched>";
+
+/// Resolve the bounded Prometheus `path` label for a request.
+///
+/// `matched_path` is axum's route TEMPLATE (`Some("/api/agents/{id}")`) when
+/// the router matched a route, or `None` for an unmatched request. Matched
+/// routes keep their template (bounded cardinality); unmatched requests all
+/// collapse to [`UNMATCHED_METRIC_PATH`]. The concrete request URI is
+/// deliberately NOT a parameter: passing it on the unmatched branch is exactly
+/// the unbounded-cardinality DoS this guards against.
+fn metric_path_label(matched_path: Option<&str>) -> &str {
+    matched_path.unwrap_or(UNMATCHED_METRIC_PATH)
+}
+
 pub async fn request_logging(mut request: Request<Body>, next: Next) -> Response<Body> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = request.method().clone();
     let uri = request.uri().path().to_string();
     let start = Instant::now();
+
+    // Prefer the matched route TEMPLATE (e.g. `/api/models/aliases/{alias}`)
+    // for the metric `path` label so free-text route params never inflate
+    // Prometheus label cardinality. `MatchedPath` is inserted by axum's
+    // router before any `Router::layer` middleware runs, so it is present
+    // for every request that matched a route. Fall back to `normalize_path`
+    // on the concrete URI only when it is absent (e.g. 404 / unmatched),
+    // which still collapses UUID/hex segments. Captured before `next.run`
+    // consumes the request.
+    let matched_path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
 
     // #3639: stash the id in request extensions BEFORE the handler runs so
     // the [`crate::extractors::RequestId`] extractor (and any handler that
@@ -504,7 +615,18 @@ pub async fn request_logging(mut request: Request<Body>, next: Next) -> Response
         );
     }
 
-    metrics::record_http_request(&uri, method.as_str(), status, elapsed);
+    // Use the matched route template when available (bounded cardinality).
+    // For UNMATCHED requests (404 / router fallback) `MatchedPath` is absent;
+    // `metric_path_label` collapses those to a single constant sentinel rather
+    // than the concrete URI. `normalize_path` only folds UUID/hex segments and
+    // leaves arbitrary free-text verbatim, so an unauthenticated client
+    // hitting `GET /nope-0000001`, `/nope-0000002`, … would otherwise mint a
+    // new permanently retained Prometheus series per URI (the recorder has no
+    // idle timeout) — an unbounded-cardinality memory-exhaustion DoS. The
+    // helper takes only the matched template, so the raw URI can never reach
+    // the label by construction.
+    let metric_path = metric_path_label(matched_path.as_deref());
+    metrics::record_http_request(metric_path, method.as_str(), status, elapsed);
 
     // Inject the request ID into the response header (always).
     if let Ok(header_val) = request_id.parse() {
@@ -1735,6 +1857,156 @@ mod tests {
         }
     }
 
+    // Finding #3: adding / updating / deleting an MCP server persists a stdio
+    // transport whose `command` + `args` are spawned under the daemon UID.
+    // That is process spawn — an Owner action — so an Admin ("config write")
+    // must be blocked, matching the install-deps boundary.
+    #[test]
+    fn test_mcp_servers_mutations_are_owner_only() {
+        // Only the config-mutation verbs are Owner-only: POST add on the
+        // collection, PUT update / DELETE remove on a `{name}` target.
+        let owner_only = [
+            (axum::http::Method::POST, "/api/mcp/servers"),
+            (axum::http::Method::PUT, "/api/mcp/servers/my-server"),
+            (axum::http::Method::DELETE, "/api/mcp/servers/my-server"),
+        ];
+        for (method, path) in owner_only {
+            for role in [UserRole::Viewer, UserRole::User, UserRole::Admin] {
+                assert!(
+                    !user_role_allows_request(role, &method, path),
+                    "{role:?} must NOT be allowed to {method} {path}"
+                );
+            }
+            assert!(
+                user_role_allows_request(UserRole::Owner, &method, path),
+                "Owner must be allowed to {method} {path}"
+            );
+        }
+        // Reads (list / detail) stay at the generic Admin-or-above gate — the
+        // GET short-circuit keeps them reachable for every role, so the gate
+        // does not over-block the dashboard MCP page.
+        let get = axum::http::Method::GET;
+        for path in ["/api/mcp/servers", "/api/mcp/servers/my-server"] {
+            for role in [
+                UserRole::Viewer,
+                UserRole::User,
+                UserRole::Admin,
+                UserRole::Owner,
+            ] {
+                assert!(
+                    user_role_allows_request(role, &get, path),
+                    "{role:?} must be allowed to GET {path}"
+                );
+            }
+        }
+        // Sub-resources that do not introduce a new spawn command keep their
+        // existing Admin gate — an Admin may still reconnect / manage OAuth,
+        // and is NOT forced up to Owner by the mutation gate.
+        for (method, path) in [
+            (
+                axum::http::Method::POST,
+                "/api/mcp/servers/my-server/reconnect",
+            ),
+            (
+                axum::http::Method::DELETE,
+                "/api/mcp/servers/my-server/auth/revoke",
+            ),
+        ] {
+            assert!(
+                user_role_allows_request(UserRole::Admin, &method, path),
+                "Admin must still be allowed to {method} {path} (not a spawn-command mutation)"
+            );
+        }
+    }
+
+    // Finding #4: `/api/terminal/ws` and the tmux window endpoints are GET
+    // routes that spawn / manage an interactive PTY under the daemon UID.
+    // The blanket "GET is read-only" rule would wave a Viewer straight into a
+    // shell, so they must require Admin+.
+    #[test]
+    fn test_terminal_privileged_gets_require_admin() {
+        let get = axum::http::Method::GET;
+        for path in [
+            "/api/terminal/ws",
+            "/api/terminal/windows",
+            "/api/terminal/windows/main",
+        ] {
+            assert_eq!(min_role_for_privileged_get(path), Some(UserRole::Admin));
+            for role in [UserRole::Viewer, UserRole::User] {
+                assert!(
+                    !user_role_allows_request(role, &get, path),
+                    "{role:?} must NOT be allowed to GET {path} (interactive shell / PTY)"
+                );
+            }
+            for role in [UserRole::Admin, UserRole::Owner] {
+                assert!(
+                    user_role_allows_request(role, &get, path),
+                    "{role:?} must be allowed to GET {path}"
+                );
+            }
+        }
+        // The health probe is an ordinary read, not privileged.
+        assert_eq!(min_role_for_privileged_get("/api/terminal/health"), None);
+        assert!(user_role_allows_request(
+            UserRole::Viewer,
+            &get,
+            "/api/terminal/health"
+        ));
+    }
+
+    // Finding #11: `GET /api/agents/{id}/ws` drives a full agent turn (LLM
+    // calls, tool execution, budget spend) on inbound messages — the same
+    // capability as REST `POST /api/agents/{id}/message`, which requires
+    // User+. A Viewer is read-only and must be rejected on the WS too, closing
+    // the RBAC inconsistency between the REST and WebSocket paths.
+    #[test]
+    fn test_agent_ws_requires_user_role() {
+        let get = axum::http::Method::GET;
+        let path = "/api/agents/abc123/ws";
+        assert_eq!(min_role_for_privileged_get(path), Some(UserRole::User));
+        // Viewer is blocked on the WS just as it is on POST /message.
+        assert!(
+            !user_role_allows_request(UserRole::Viewer, &get, path),
+            "Viewer must NOT be allowed to GET the agent WS (drives LLM turns)"
+        );
+        assert!(!user_role_allows_request(
+            UserRole::Viewer,
+            &axum::http::Method::POST,
+            "/api/agents/abc123/message"
+        ));
+        // User+ can drive turns over both the WS and REST.
+        for role in [UserRole::User, UserRole::Admin, UserRole::Owner] {
+            assert!(
+                user_role_allows_request(role, &get, path),
+                "{role:?} must be allowed to GET the agent WS"
+            );
+        }
+        // A plain agent GET (not a WS upgrade) is an ordinary read.
+        assert_eq!(min_role_for_privileged_get("/api/agents/abc123"), None);
+        assert!(user_role_allows_request(
+            UserRole::Viewer,
+            &get,
+            "/api/agents/abc123"
+        ));
+    }
+
+    // Finding #20: unmatched requests must all collapse to a single bounded
+    // Prometheus `path` label instead of leaking the concrete URI (which would
+    // let unique-path spam mint unbounded, never-evicted metric series).
+    #[test]
+    fn test_unmatched_metric_path_collapses_to_constant() {
+        // Matched routes keep their template.
+        assert_eq!(
+            metric_path_label(Some("/api/agents/{id}")),
+            "/api/agents/{id}"
+        );
+        // Every unmatched request maps to the same constant — the helper has
+        // no access to the raw URI, so distinct 404 paths cannot diverge.
+        assert_eq!(metric_path_label(None), UNMATCHED_METRIC_PATH);
+        assert_eq!(metric_path_label(None), metric_path_label(None));
+        assert_ne!(UNMATCHED_METRIC_PATH, "/nope-0000001");
+    }
+
     // #3621: TOTP enrollment must be Owner-only. Without this gate, any
     // bearer token (including a Viewer or User role) could overwrite the
     // unconfirmed `totp_secret` and hijack enrollment, or wipe a confirmed
@@ -1844,6 +2116,40 @@ mod tests {
             assert!(
                 !user_role_allows_request(UserRole::User, &post, path),
                 "User must NOT be allowed to POST {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_role_approval_suffixes_anchored_to_approvals_prefix() {
+        // The `/approve`, `/reject`, `/modify`, … suffixes are meant only for
+        // tool-call approval actions under `/api/approvals/`. Left unanchored
+        // they also matched `/api/skills/pending/{id}/approve` and
+        // `/api/a2a/agents/{id}/approve`, neither of which has an in-handler
+        // role check — a User bearer could approve pending skills and trust
+        // A2A agents (privilege escalation).
+        let post = axum::http::Method::POST;
+        for path in [
+            "/api/skills/pending/x/approve",
+            "/api/skills/pending/x/reject",
+            "/api/a2a/agents/x/approve",
+            "/api/a2a/agents/x/reject",
+        ] {
+            assert!(
+                !user_role_allows_request(UserRole::User, &post, path),
+                "User must NOT be allowed to POST {path}"
+            );
+        }
+        // Genuine tool-call approval actions stay allowed for User.
+        for path in [
+            "/api/approvals/x/approve",
+            "/api/approvals/batch",
+            "/api/approvals/session/sess-1/approve_all",
+            "/api/approvals/x/modify",
+        ] {
+            assert!(
+                user_role_allows_request(UserRole::User, &post, path),
+                "User must be allowed to POST {path}"
             );
         }
     }
@@ -3273,6 +3579,45 @@ mod tests {
         // deserialize. The point of this test is that the *middleware*
         // doesn't short-circuit a 400 on malformed JSON itself.
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_logging_sees_matched_route_template_not_free_text_param() {
+        // Regression for finding #14: the metric `path` label must be built
+        // from the matched route TEMPLATE, not the concrete URI, so a
+        // free-text route param never inflates Prometheus label cardinality.
+        //
+        // `request_logging` reads `MatchedPath` from the request extensions
+        // before calling `next.run`; the inner handler reads the very same
+        // extension. axum inserts `MatchedPath` during routing (before any
+        // `Router::layer` middleware runs), so asserting the handler sees the
+        // template pins the exact value `request_logging` forwards to
+        // `record_http_request`. Before the fix the concrete path
+        // (`/api/models/aliases/some-free-text-alias`) was used verbatim.
+        use axum::extract::MatchedPath;
+
+        async fn echo_matched_path(matched: MatchedPath) -> String {
+            matched.as_str().to_string()
+        }
+
+        let app: Router = Router::new()
+            .route("/api/models/aliases/{alias}", get(echo_matched_path))
+            .layer(axum::middleware::from_fn(request_logging));
+
+        let req = Request::get("/api/models/aliases/some-free-text-alias")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "/api/models/aliases/{alias}",
+            "request_logging must observe the route template, not the free-text param"
+        );
     }
 
     /// Regression for #4860: the inline login page must redirect to `/`
