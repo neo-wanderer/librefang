@@ -784,6 +784,12 @@ impl LibreFangKernel {
             .actual_provider
             .clone()
             .unwrap_or_else(|| manifest.model.provider.clone());
+        // #6460: mirror the `owner.or(attribution_user_id)` precedence used at the other two write sites (`execute_llm_agent`, the streaming task).
+        // `sender_context` is NOT always `None` here: the channel-bridge /btw path (`crates/librefang-api/src/channel_bridge.rs::send_message_ephemeral`) always calls through with `owner: None` but forwards a real `SenderContext`, so falling back to sender-derived attribution keeps that call attributed instead of silently unattributed.
+        // No fork reaches this path.
+        let attribution_user_id: Option<UserId> =
+            sender_context.and_then(|sc| self.security.auth.identify(&sc.channel, &sc.user_id));
+        let billed_user_id: Option<UserId> = owner.or(attribution_user_id);
         let usage_record = librefang_memory::usage::UsageRecord {
             agent_id,
             provider: billed_provider,
@@ -795,7 +801,7 @@ impl LibreFangKernel {
             cost_usd: cost,
             tool_calls: result.decision_traces.len() as u32,
             latency_ms,
-            user_id: None,
+            user_id: billed_user_id,
             channel: None,
             session_id: None,
         };
@@ -810,6 +816,26 @@ impl LibreFangKernel {
                 "Post-call quota check failed (ephemeral); recording usage anyway"
             );
             let _ = self.metering.engine.record(&usage_record);
+        } else if let Some(uid) = billed_user_id {
+            // #6460: per-user budget enforcement, post-call, mirroring the same audit-trail-only semantics as the other two write sites — a breach trips `BudgetExceeded` for dashboard visibility but does not deny this already-billed response.
+            if let Some(user_budget) = self.security.auth.budget_for(uid) {
+                if let Err(e) = self.metering.engine.check_user_budget(uid, &user_budget) {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        user = %uid,
+                        error = %e,
+                        "Per-user budget check failed (ephemeral)"
+                    );
+                    self.metering.audit_log.record_with_context(
+                        agent_id.to_string(),
+                        librefang_runtime::audit::AuditAction::BudgetExceeded,
+                        format!("{e}"),
+                        "denied",
+                        Some(uid),
+                        None,
+                    );
+                }
+            }
         }
 
         // Record experiment metrics if running an experiment (kernel has cost info)
@@ -1009,7 +1035,26 @@ impl LibreFangKernel {
         // key re-acquires `session_msg_locks[sid]` — also non-reentrant — on
         // the same task. Check the held-session registry for that path rather
         // than exempting it.
-        match session_id_override {
+        // An explicit `session_id_override` that equals the agent's canonical
+        // (persistent) session addresses the SAME session the no-override
+        // persistent path writes. Selecting the per-*session* lock for it while
+        // that path takes the per-*agent* lock would let the two dispatches
+        // write one session under two different mutexes concurrently — a lost
+        // update / corrupted history. Collapse such an override to the
+        // per-agent lock namespace so both serialize on the same mutex. The
+        // raw `session_id_override` is still passed to
+        // `resolve_dispatch_session_id` below, so the resolved session id is
+        // unchanged; only the lock (and its re-entrancy / held-lock tracking)
+        // is normalized. (Read the canonical id once here; it is mutable via
+        // switch_agent_session, but a concurrent switch mid-dispatch is out of
+        // scope, as it already is for the resolution read below.)
+        let canonical_session_id = self.agents.registry.get(agent_id).map(|e| e.session_id);
+        let session_lock_key: Option<SessionId> = match session_id_override {
+            Some(sid) if Some(sid) != canonical_session_id => Some(sid),
+            _ => None,
+        };
+
+        match session_lock_key {
             None => {
                 if librefang_runtime::held_agent_locks::is_held(agent_id) {
                     let mut chain: Vec<String> =
@@ -1055,7 +1100,7 @@ impl LibreFangKernel {
         // are not serialized against each other (multi-tab / multi-session UIs).
         // Without an override, fall back to the per-agent lock to preserve the
         // existing serialization guarantee for single-session agents.
-        let (lock, agent_scoped) = if let Some(sid) = session_id_override {
+        let (lock, agent_scoped) = if let Some(sid) = session_lock_key {
             (
                 self.agents
                     .session_msg_locks
@@ -1095,7 +1140,7 @@ impl LibreFangKernel {
         // a re-entrant keyed `agent_send` (same conversation_key, transitive
         // A->B->A) is rejected above instead of deadlocking on the
         // non-reentrant `session_msg_locks[sid]` mutex.
-        let _held_session_guard = match session_id_override {
+        let _held_session_guard = match session_lock_key {
             Some(sid) if !agent_scoped => {
                 Some(librefang_runtime::held_agent_locks::HeldSessionLockGuard::register(sid))
             }
@@ -1145,15 +1190,12 @@ impl LibreFangKernel {
             .map_err(KernelError::LibreFang)?;
 
         // Enforce quota on the effective target agent (after routing).
-        // Use check_quota_and_reserve so the estimated token budget is
-        // pre-charged inside the same DashMap write-lock, closing the TOCTOU
-        // race where N concurrent callers all pass the check before any of
-        // them calls record_usage (#3736).
+        // Use reserve_tokens so the estimated token budget is pre-charged inside the same DashMap write-lock, closing the TOCTOU race where N concurrent callers all pass the check before any of them calls record_usage (#3736).
         let estimated_tokens = entry.manifest.model.max_tokens as u64;
         let token_reservation = match self
             .agents
             .scheduler
-            .check_quota_and_reserve(agent_id, estimated_tokens)
+            .reserve_tokens(agent_id, estimated_tokens)
         {
             Ok(r) => r,
             Err(e) => {
@@ -1168,9 +1210,7 @@ impl LibreFangKernel {
             tracing::debug!(agent_id = %agent_id, "Skipping message to suspended agent");
             // No LLM call is made; release reservations without inflating
             // llm_calls or the burst window.
-            self.agents
-                .scheduler
-                .release_reservation(agent_id, token_reservation);
+            token_reservation.release();
             usd_reservation.release();
             return Ok(AgentLoopResult::default());
         }
@@ -1226,11 +1266,7 @@ impl LibreFangKernel {
                 // cost will be recorded by `check_all_and_record` further
                 // down the call path; releasing the in-memory hold lets
                 // the next reservation pass see a consistent total.
-                self.agents.scheduler.settle_reservation(
-                    agent_id,
-                    token_reservation,
-                    &result.total_usage,
-                );
+                token_reservation.settle(&result.total_usage);
                 usd_reservation.settle();
                 // Record tool calls for rate limiting
                 let tool_count = result.decision_traces.len() as u32;
@@ -1540,9 +1576,7 @@ impl LibreFangKernel {
             Err(e) => {
                 // Release the pre-charged token + USD reservations — the
                 // agent loop failed before completing, no usage to settle.
-                self.agents
-                    .scheduler
-                    .release_reservation(agent_id, token_reservation);
+                token_reservation.release();
                 usd_reservation.release();
 
                 // SECURITY: Record failed message in audit trail
@@ -2101,7 +2135,7 @@ impl LibreFangKernel {
         let token_reservation = match self
             .agents
             .scheduler
-            .check_quota_and_reserve(agent_id, estimated_tokens)
+            .reserve_tokens(agent_id, estimated_tokens)
         {
             Ok(r) => r,
             Err(e) => {
@@ -2152,11 +2186,7 @@ impl LibreFangKernel {
                             })
                             .await;
                         // Settle pre-charged reservation (#3736)
-                        kernel_clone.agents.scheduler.settle_reservation(
-                            agent_id,
-                            token_reservation,
-                            &result.total_usage,
-                        );
+                        token_reservation.settle(&result.total_usage);
                         // Release the global USD hold — non-LLM modules incur
                         // no provider cost, so there is nothing to settle.
                         usd_reservation.release();
@@ -2170,10 +2200,7 @@ impl LibreFangKernel {
                         // Non-LLM agent (wasm/python) failed — never made an
                         // LLM call, release reservation without inflating
                         // llm_calls.
-                        kernel_clone
-                            .agents
-                            .scheduler
-                            .release_reservation(agent_id, token_reservation);
+                        token_reservation.release();
                         usd_reservation.release();
                         kernel_clone.agents.supervisor.record_panic();
                         warn!(agent_id = %agent_id, error = %e, "Non-LLM agent failed");
@@ -2772,6 +2799,10 @@ impl LibreFangKernel {
         let attribution_user_id: Option<UserId> =
             sender_context.and_then(|sc| self.security.auth.identify(&sc.channel, &sc.user_id));
         let attribution_channel: Option<String> = sender_context.map(|sc| sc.channel.clone());
+        // #6460: the authenticated owner's vault key is billed upstream (via `effective_owner` → `resolve_driver_for_owner`), so usage attribution and the per-user budget gate must key on that owner when present — otherwise a plain authenticated stream (sender_context = None → attribution_user_id = None) records the owner's own-key spend unattributed and never enforces their budget.
+        // Use `effective_owner` (already null for forks, computed above) NOT the raw owner, so a sub-agent's spend is not mis-attributed to the parent turn's user.
+        // Snapshot into a Copy local before the spawn moves it into the task.
+        let billed_user_id: Option<UserId> = effective_owner.or(attribution_user_id);
 
         // `loop_opts` is already a local — the spawned async move will
         // capture it. Agent loop reads these at each turn-end / save /
@@ -2795,7 +2826,30 @@ impl LibreFangKernel {
         // paths can observe this streaming turn's holding of agent_msg_locks
         // and skip / reject as appropriate. Mirrors the non-streaming site at
         // `send_message_full_inner` (~L871-906).
-        let (session_lock, agent_scoped) = if session_id_override.is_some() {
+        // Collapse an override that targets the agent's canonical session onto
+        // the per-agent lock, exactly as the non-streaming
+        // `send_message_full_inner` site does: an override equal to
+        // `entry.session_id` writes the SAME session the no-override persistent
+        // path writes, so taking the per-session lock here while that path
+        // takes the per-agent lock would let the two write one session under
+        // two mutexes concurrently (lost update). `effective_session_id`
+        // already resolves to the canonical id in that case, so only the lock
+        // namespace changes; a no-override channel dispatch keeps the per-agent
+        // lock (narrow fix — the channel-derived variant is unchanged here).
+        //
+        // Re-read the canonical id FRESH here rather than reusing the `entry`
+        // snapshot captured ~760 lines above (line ~2065): `entry.session_id`
+        // is mutable via `switch_agent_session` (#4291), and this non-async fn
+        // does substantial preemptible synchronous work (catalog/budget/quota,
+        // session-mode resolution) between that fetch and this decision, so a
+        // concurrent rotation could leave the snapshot stale and mis-select the
+        // lock namespace — reintroducing the very race this fix closes. Mirrors
+        // the non-streaming `send_message_full_inner` site, and the fork branch
+        // above which reads the parent session id from `loop_opts`, not `entry`.
+        let canonical_session_id = self.agents.registry.get(agent_id).map(|e| e.session_id);
+        let session_scoped_lock =
+            matches!(session_id_override, Some(sid) if Some(sid) != canonical_session_id);
+        let (session_lock, agent_scoped) = if session_scoped_lock {
             (
                 self.agents
                     .session_msg_locks
@@ -3092,11 +3146,7 @@ impl LibreFangKernel {
                     // Settle the pre-charged token reservation with actual usage
                     // (#3736). This replaces record_usage for the token counters
                     // while still correctly accounting for the burst window.
-                    kernel_clone.agents.scheduler.settle_reservation(
-                        agent_id,
-                        token_reservation,
-                        &result.total_usage,
-                    );
+                    token_reservation.settle(&result.total_usage);
                     // Settle the global USD hold (#3616) — actual spend is
                     // recorded via `check_all_and_record`; this frees the
                     // pre-call ceiling that throttled concurrent fires.
@@ -3147,9 +3197,9 @@ impl LibreFangKernel {
                         cost_usd: cost,
                         tool_calls: result.decision_traces.len() as u32,
                         latency_ms,
-                        // RBAC M5: attribution captured from sender_context
+                        // RBAC M5 + #6460: owner-preferred attribution captured
                         // before the spawn — moves into this async block.
-                        user_id: attribution_user_id,
+                        user_id: billed_user_id,
                         channel: attribution_channel.clone(),
                         session_id: Some(effective_session_id),
                     };
@@ -3170,11 +3220,11 @@ impl LibreFangKernel {
                             librefang_runtime::audit::AuditAction::BudgetExceeded,
                             format!("{e}"),
                             "denied",
-                            attribution_user_id,
+                            billed_user_id,
                             attribution_channel.clone(),
                         );
                         let _ = kernel_clone.metering.engine.record(&usage_record);
-                    } else if let Some(uid) = attribution_user_id {
+                    } else if let Some(uid) = billed_user_id {
                         // RBAC M5: per-user budget enforcement, post-call.
                         // `check_all_and_record` already persisted the row,
                         // so `query_user_*` reflects this call. A breach
@@ -3330,10 +3380,7 @@ impl LibreFangKernel {
                     kernel_clone.refresh_openrouter_catalog_after_model_not_found(&manifest, &e);
                     // Release the pre-charged token reservation — the
                     // streaming loop failed, no usage to settle.
-                    kernel_clone
-                        .agents
-                        .scheduler
-                        .release_reservation(agent_id, token_reservation);
+                    token_reservation.release();
                     usd_reservation.release();
                     kernel_clone.agents.supervisor.record_panic();
                     warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
