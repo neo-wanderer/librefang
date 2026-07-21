@@ -7,6 +7,26 @@ and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 
 ## [Unreleased]
 
+### Added
+
+- Implement the MCP `resources` primitive in the `librefang-runtime-mcp` client, which was previously tools-only, so an agent can now consume MCP servers that expose their data as resources rather than tools.
+  `McpConnection` gains `list_resources` (`resources/list`), `read_resource` (`resources/read`), and `list_resource_templates` (`resources/templates/list`) on both the rmcp (stdio + streamable-HTTP) and hand-rolled SSE transports; HttpCompat has no resources concept and returns a clear error.
+  When a server advertises the `resources` capability (read live from the rmcp handshake `peer_info`, or captured from the SSE `initialize` response) the client registers two synthetic tools — `list_resources` and `read_resource` — that flow through the normal tool-call loop and are intercepted before the transport `tools/call`, so a real server tool literally named `read_resource` is unaffected.
+  A `resource_link` in a tool result is now surfaced as a first-class `[resource_link] name — uri (mime)` line instead of being flattened into an opaque JSON string, and an embedded resource contributes its text (binary blobs are elided, never inlined into the prompt); resource lists are sorted by URI for prompt-cache stability.
+  No `resources` client capability is declared because the MCP `resources` capability is server-side and rmcp's `ClientCapabilities` has no such field (#6501) (@houko)
+
+### Changed
+
+- Upgrade `agent-client-protocol` from 0.11.1 to 1.3.0 in the `librefang-acp` crate, migrating the ACP adapter to the 1.x API (supersedes the version-only dependabot bump that left the crate failing to compile).
+  The 1.x SDK moved the wire-schema types under a versioned namespace, so every `agent_client_protocol::schema::X` import is now `agent_client_protocol::schema::v1::X` (with `ProtocolVersion` re-exported at the `schema` root); the connection, router, and JSON-RPC surface (`Agent`, `Client`, `ConnectionTo`, `Builder`, `ByteStreams`, `Responder`, `on_receive_*`, `util`) is unchanged at the crate root.
+  The companion `agent-client-protocol-tokio` crate has no 1.x release and was pulling a second, older copy of `agent-client-protocol` (and a stale `rmcp` 1.8) into the tree, so it is dropped entirely: its sole use, `agent_client_protocol_tokio::Stdio`, is replaced by `agent_client_protocol::Stdio`, which 1.x exposes at its own crate root with the same `Stdio::new()` constructor (#6526) (@houko)
+
+### Changed
+
+- Normalize on-disk upload naming so every producer that writes into the shared upload directory names the file `<uuid>.<ext>` instead of today's three divergent schemes (bare `<uuid>`, `image_<uuid>.png`, `<uuid>.<ext>`), keeping the file's type at rest for extension-sniffing tools and for any flow that persists or re-dispatches the bytes.
+  A single deterministic `librefang_types::media::on_disk_name(file_id, content_type, filename)` helper (extension from `ext_for_content_type`, then a safe filename extension, else a bare UUID) is now the one naming authority: the API upload / media / session-image / generated-image / browser-screenshot producers all route through it, and the client-facing `file_id` stays a bare UUID so the path-traversal and #3361 owner guards still `uuid::Uuid::parse_str` it.
+  `serve_upload` and `resolve_attachments` reconstruct the name through a shared resolver that also tolerates legacy bare-`<uuid>` files and probes `<uuid>.*` for generated images not in the upload registry, so existing uploads keep serving (#6530) (@houko)
+
 ### Documentation
 
 - Document how `[approval].trusted_senders` composes with `[[users]]` RBAC on the approvals security page (EN + zh mirror): the two are separate trust surfaces and the per-user RBAC gate is evaluated first, so an ID listed in `trusted_senders` that is not also a registered `[[users]]` on the `api` channel still has its low-risk tools (e.g. `memory_*`) gated by the `guest_gate`, because the forced-approval verdict short-circuits before the `trusted_senders` bypass is consulted; the new subsection gives the concrete fix (register the operator as a `[[users]]` bound to the `api` channel with a `tool_policy` covering the tools it drives) and notes that with no `[[users]]` configured `trusted_senders` works standalone (#6492) (@houko)
@@ -14,6 +34,12 @@ and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 
 ### Fixed
 
+- Apply the `[approval] auto_approve = true` shorthand when the policy is installed into the `ApprovalManager`, fixing a silent no-op where the flag cleared nothing and every tool stayed gated.
+  `ApprovalPolicy::apply_shorthands` (which clears `require_approval` when `auto_approve` is set) was only ever called from a unit test — the daemon-boot path (`ApprovalManager::new_with_db`) and the hot-reload path (`update_policy`) both installed `config.approval` verbatim, so an operator who set `auto_approve = true` to disable gating got no effect and the field's own doc comment ("clears the require list at boot") was false.
+  The shorthand is now applied at all three policy-install entry points (`new`, `new_with_db`, `update_policy`), so `auto_approve` takes effect at boot and on `POST /api/config/reload`; the separate `trusted_senders` / `[[users]]` RBAC layering is documented above and unchanged (#6492) (@houko)
+- Return a deterministic `409 Conflict` when a client resolves an approval that was already resolved, instead of a non-deterministic `400`-or-`404` that depended on whether the in-memory `recent` ring still held the entry.
+  `ApprovalManager::resolve` reported "Already {decision} by {who}" (mapped to `400`) only while the resolution sat in the 100-slot buffer, and degraded to "not found" (`404`) once the buffer evicted it or the daemon restarted, so the same double-resolve returned different statuses depending on load and uptime.
+  `resolve` now falls back to the durable `approval_audit` log to recognize an already-terminal request, and the api boundary maps the "Already …" verdict to a new typed `LibreFangError::Conflict` (`409`, code `conflict`) a client can act on, while a genuinely-unknown id still returns `404` and a missing second factor still returns `400` (#6492) (@houko)
 - Stop `KnowledgeStore::delete_by_agent` from silently orphaning another agent's knowledge when a shared entity's first-writer agent is deleted (#6521).
   Entities are keyed on `(id, peer_id)` — not `agent_id`, which is only first-writer provenance — so a deterministic-id entity (a well-known org/person name) first written by agent A can be referenced by agent B's live relations; deleting every `agent_id = A` entity on A's deletion removed that shared row, and B's relations quietly stopped resolving (the JOIN just stopped matching — no error, data vanished from future reads).
   `delete_by_agent` now deletes A's relations wholesale (they are strictly per-agent) but only removes A's entities that NO surviving relation still references by id or name, keeping shared, still-referenced entities in place.
@@ -158,6 +184,100 @@ and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 ### Documentation
 
 - Document installation from the signed project-maintained Arch Linux pacman repository while AUR account registration is unavailable (#6386) (@pavver)
+
+## [2026.7.21] - 2026-07-21
+
+_61 PRs from 4 contributors since v2026.7.11._
+
+### Highlights
+
+- **Per-user LLM provider credentials** — users can bring their own API keys with per-owner spend attribution, org-wide provider allowlists, and budget enforcement on authenticated turns
+- **MCP resources primitive** — agents can now access MCP-exposed resources, rounding out the MCP integration beyond tools alone
+- **Multi-user knowledge graph scoping** — the knowledge graph is now partitioned per user on shared agents, closing a cross-user data leak
+- **Slack multi-step progress** — long-running agent tasks surface live phase updates in Slack via Block Kit message edits instead of a single final reply
+- **HAND.toml online editing & expanded delivery targets** — edit hand manifests directly from the Hands panel in the dashboard, and delivery-target channel presets now reach all sidecar adapters
+
+### Added
+
+- Env opt-out (TELEGRAM_STREAMING) for the streaming path (#6482) (@houko)
+- Per-user LLM provider credentials with per-owner usage attribution (initial) (#6483) (@houko)
+- Org-wide LLM provider allowlist (fail-closed at driver resolution) (#6484) (@houko)
+- Slack multi-step progress display via AgentPhase-driven Block Kit updates (#6487) (@houko)
+- Per-user attribution survey + API-level user filtering of audit queries (#6488) (@houko)
+- Process_start completion notification via the async task tracker (#6489) (@houko)
+- Edit HAND.toml online from the Hands panel (#6490) (@houko)
+- Scope the knowledge graph per user (peer_id) on multi-user agents (#6494) (#6502) (@houko)
+- Expand delivery-target channel presets to all sidecar adapters (#6506) (@houko)
+- Owner-gated CRUD for per-user provider credentials (#6460) (#6509) (@houko)
+- Implement the MCP resources primitive (#6501) (#6532) (@houko)
+
+### Fixed
+
+- Prefer the live model catalog with a build fallback (#6384) (@pavver)
+- Security and correctness hardening from repo-wide audit (#6438) (@houko)
+- Second-pass security and correctness hardening from repo-wide audit (#6439) (@houko)
+- Third-pass security and correctness hardening from repo-wide audit (#6441) (@houko)
+- Fourth-pass security and correctness hardening from repo-wide audit (#6446) (@houko)
+- Resolve four reported bugs (#6423, #6442, #6443, #6444) (#6449) (@houko)
+- Enforce cross-account channel_send guard through the /mcp bridge (#6443) (#6455) (@houko)
+- Trust operator env allowlist in sandbox_command (#6465) (@houko)
+- Treat retired pnpm audit endpoint as skip, not a dependency issue (#6466) (@houko)
+- Field-scope dm_policy/group_policy so a partial override stops silently gating groups, and expose them on [[sidecar_channels]] (#6445) (#6468) (@houko)
+- Distinguish context and budget limits (#6479) (@houko)
+- Allow dashboard login script under CSP (#6480) (@houko)
+- Treat auto_dream fork tool calls as system-internal so RBAC does not gate them (#6485) (@houko)
+- Login page unreadable in light theme (CSS cascade source-order bug) (#6486) (@houko)
+- Pin login_page.html to LF so the CSP-hash test passes on Windows (#6481) (#6496) (@houko)
+- Gate compacted summary by owning session to stop cross-user prompt leak (#6493) (#6497) (@houko)
+- Honour glob patterns in per-agent tool_allowlist/tool_blocklist (#6495) (#6498) (@houko)
+- Approvals approve 415 false-success + status column in approvals list (#6492) (#6500) (@houko)
+- Stop over-blocking MCP arguments that carry a long numeric id (#6499) (#6503) (@houko)
+- Route post-approval reply through account-qualified outbound (#6492) (#6511) (@houko)
+- Surface mid-stream provider errors instead of empty/garbled turns (#6512) (@houko)
+- Release the token reservation on drop to stop a quota self-DoS (#6513) (@houko)
+- Attribute owner-key spend and enforce per-user budget on authenticated API turns (#6514) (@houko)
+- Honor response_format in the Gemini and Vertex AI drivers (#6515) (@houko)
+- Treat [browser] config-reload as restart-required, not a false hot-reload (#6516) (@houko)
+- Canonicalize provider before the per-user key lookup to stop an alias chargeback leak (#6517) (@houko)
+- Serialize a canonical-session override on the per-agent lock to stop a lost-update race (#6518) (@houko)
+- Scope MCP knowledge_add_* writes to the calling agent, not agent_id="" (#6519) (@houko)
+- Recognize CHANGELOG attribution on a bullet's continuation lines (#6520) (@houko)
+- Don't orphan another agent's relations when deleting a shared entity's first-writer (#6522) (@houko)
+- Honor auto_approve and return 409 on double-resolve (#6492) (#6528) (@houko)
+- Surface on-disk upload path to agents for every file type (#6531) (@neo-wanderer)
+
+### Changed
+
+- Normalize on-disk upload naming to <uuid>.<ext> (#6530) (#6536) (@houko)
+
+<details>
+<summary>Documentation, maintenance, and other internal changes</summary>
+
+### Documentation
+
+- Explain trusted_senders vs [[users]] RBAC composition (#6492) (#6507) (@houko)
+- Document per-user key precedence over operator rotation (#6460) (#6510) (@houko)
+
+### Maintenance
+
+- Bump the cargo-minor-patch group with 10 updates (#6452) (@app/dependabot)
+- Bump tokio-tungstenite from 0.29.0 to 0.30.0 (#6453) (@app/dependabot)
+- Update yanked spin 0.9.8 to 0.9.9 (#6454) (@houko)
+- Bump the actions-minor-patch group with 3 updates (#6456) (@app/dependabot)
+- Bump actions/setup-node from 6.4.0 to 7.0.0 (#6457) (@app/dependabot)
+- Lock in env trust split across defer→approve→resume (follow-up to #6465) (#6467) (@houko)
+- Bump the web-minor-patch group in /web with 5 updates (#6472) (@app/dependabot)
+- Bump the dashboard-minor-patch group in /crates/librefang-api/dashboard with 6 updates (#6473) (@app/dependabot)
+- Bump @eslint/js from 9.39.4 to 9.39.5 in /crates/librefang-api/dashboard (#6474) (@app/dependabot)
+- Bump serde_with from 3.18.0 to 3.21.0 (#6475) (@app/dependabot)
+- Bump the docs-minor-patch group in /docs with 4 updates (#6491) (@app/dependabot)
+- Update model snapshot (#6523) (@houko)
+- Bump wasmtime from 46.0.1 to 47.0.1 (#6527) (@app/dependabot)
+- Bump the cargo-minor-patch group across 1 directory with 17 updates (#6533) (@app/dependabot)
+- Migrate librefang-acp to agent-client-protocol 1.3.0 (supersedes #6526) (#6534) (@houko)
+
+</details>
+
 
 ## [2026.7.10] - 2026-07-10
 
